@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pymysql
+python-dotenv
+mangum
+openai
+boto3
+pillow
+pyjwt
