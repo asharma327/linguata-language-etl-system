@@ -399,16 +399,20 @@ def insert_lessons(body: InsertLessonsRequest):
 
         # --- Parse JSON ---
         try:
-            data = json.loads(json_file.read_text(encoding="utf-8"))
+            raw_data = json.loads(json_file.read_text(encoding="utf-8-sig"))
         except Exception as e:
             file_log["status"] = "failed"
             file_log["errors"].append(f"JSON parse error: {e}")
             files_failed.append(file_log)
             continue
 
+        # Support both a single lesson object {...} and a list of lessons [...]
+        lesson_entries = raw_data if isinstance(raw_data, list) else [raw_data]
+
         # --- Insert into DB (one transaction per file) ---
         try:
             with conn.cursor() as cur:
+              for data in lesson_entries:
 
                 # 1. Lesson
                 has_question = 1 if data.get("questions_and_answers") else 0
@@ -457,7 +461,7 @@ def insert_lessons(body: InsertLessonsRequest):
                     question_id = cur.lastrowid
                     file_log["questions_inserted"] += 1
 
-                    # Answers — handle all 3 formats:
+                    # Answers — handle all formats:
                     # A) answers[].answer_text  (vocabulary short_answer)
                     # B) flat answer + is_correct on the question  (grammar short_answer)
                     # C) answers[].answer  (multiple_choice)
@@ -942,9 +946,11 @@ class GrammarScriptToAudio:
 
     SCRIPT_MODEL = "gpt-5-mini"
     TTS_MODEL = "gpt-4o-mini-tts"
-    TTS_VOICE = "alloy"
+    TTS_VOICE = "marin"
     TTS_INSTRUCTIONS = (
-        "Speak slowly and clearly with lots of pauses; warm, friendly, teacher-like tone."
+        "Use a warm, friendly, teacher-like adult female voice. "
+        "Speak slowly and clearly with gentle pauses. "
+        "Sound encouraging, calm, and natural."
     )
 
     def __init__(self, api_key: str | None = None):
@@ -956,7 +962,7 @@ class GrammarScriptToAudio:
             "You are a helpful educator. Rewrite the following into a clear, friendly, "
             "instructional script that is between 100 and 120 words. Keep it positive, "
             "encouraging, and easy to follow. Do not include any extra commentary, only the script. "
-            "Make sure it is smooth and natural, as it will be translated to speech. "
+            "Make sure it is smooth and natural, as it will be translated to speech."
             "Make sure the script is direct and to the point without any introduction or preamble. "
             "This will be used on a Duolingo-style app but for working professionals, "
             "so the script should be to the point and get the information across quickly and directly.\n\n"
@@ -1272,16 +1278,16 @@ def generate_grammar_audio(body: GenerateGrammarAudioRequest):
 
             # Path 1: units → all grammar articles
             if body.units:
-                like_clauses = " OR ".join(["l.title LIKE %s" for _ in body.units])
-                like_params = [f"unit{u}_grammar%" for u in body.units]
+                regexp_clauses = " OR ".join(["l.title REGEXP %s" for _ in body.units])
+                regexp_params = [f"^unit{u}_" for u in body.units]
                 cur.execute(f"""
                     SELECT a.article_id, a.lesson_id, a.sequence_id, a.content, l.title
                     FROM Article a
                     JOIN Lesson l ON l.lesson_id = a.lesson_id
-                    WHERE ({like_clauses})
+                    WHERE ({regexp_clauses})
                       AND l.type = 'grammar'
                     LIMIT %s
-                """, (*like_params, body.limit_articles))
+                """, (*regexp_params, body.limit_articles))
                 for row in cur.fetchall():
                     work_items.append({
                         "lesson_id": row["lesson_id"],
@@ -2762,7 +2768,7 @@ def replace_speaking_articles(body: ReplaceSpeakingArticlesRequest):
 
             # Parse JSON
             try:
-                data = json.loads(json_file.read_text(encoding="utf-8"))
+                data = json.loads(json_file.read_text(encoding="utf-8-sig"))
                 logger.info("[%s] JSON parsed successfully", json_file.name)
             except Exception as e:
                 logger.warning("[%s] JSON parse error: %s", json_file.name, e)
@@ -3092,7 +3098,7 @@ def backfill_answer_text(body: BackfillAnswerTextRequest):
 
             # Parse JSON
             try:
-                data = json.loads(json_file.read_text(encoding="utf-8"))
+                data = json.loads(json_file.read_text(encoding="utf-8-sig"))
             except Exception as e:
                 file_log["status"] = "failed"
                 file_log["errors"].append(f"JSON parse error: {e}")

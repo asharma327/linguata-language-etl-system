@@ -4,13 +4,14 @@ import json
 from dotenv import load_dotenv
 
 load_dotenv()
+language = "german"
 
 if __name__ == "__main__":
     DB = {
         "host": os.environ["DB_HOST"],
         "user": os.environ["DB_USER"],
         "password": os.environ["DB_PASSWORD"],
-        "database": "hindi"
+        "database": language
     }
 
     # --- Configure below ---
@@ -18,7 +19,7 @@ if __name__ == "__main__":
     AWS_ACCESS_KEY_ID     = os.environ["AWS_ACCESS_KEY_ID"]
     AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
     S3_BUCKET             = "content-media-generation"
-    S3_PREFIX             = "hindi/grammar_videos"
+    S3_PREFIX             = f"{language}/grammar_videos"
     AWS_REGION            = "us-east-1"
     FORCE                 = False    # set True to re-insert even if VideoLesson already exists
 
