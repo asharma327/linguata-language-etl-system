@@ -1085,7 +1085,6 @@ def generate_lesson_images(body: GenerateImagesRequest):
                     LEFT JOIN Image i ON i.lesson_id = l.lesson_id AND i.question_id = q.question_id
                     WHERE ({like_clauses})
                       AND l.type = 'vocabulary'
-                      AND LENGTH(q.question_text) > 4
                       AND i.image_id IS NULL
                     LIMIT %s
                 """, (*like_params, body.limit_questions))
@@ -1553,6 +1552,7 @@ def generate_listening_questions(body: GenerateListeningQuestionsRequest):
     )
 
 
+## TODO: make sure the spoken audio is natural for the language (DOES NOT HAVE AN ACCENT)
 @app.post("/generate-vocab-audio")
 def generate_vocab_audio(body: GenerateVocabAudioRequest):
     """
