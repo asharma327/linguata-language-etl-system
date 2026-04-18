@@ -1,4 +1,6 @@
 branch-defaults:
+  main:
+    environment: Language-media-gen-env-1
   master:
     environment: Language-media-gen-env-1
 environment-defaults:
