@@ -1,8 +1,8 @@
 branch-defaults:
   main:
-    environment: Language-media-gen-env-1
+    environment: Language-media-gen-env-2
   master:
-    environment: Language-media-gen-env-1
+    environment: Language-media-gen-env-2
 environment-defaults:
   Greenbelt-generation-env:
     branch: null
