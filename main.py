@@ -128,7 +128,9 @@ class GenerateVocabAudioRequest(BaseModel):
     tts_model: str = "gpt-4o-mini-tts"
     voice: str = "alloy"
     tts_instructions: str | None = (
-        "Speak slowly and clearly with a warm, friendly, teacher-like tone."
+        "Speak slowly and clearly with a warm, friendly, teacher-like tone. "
+        "When the text is English, use standard native English with no foreign accent "
+        "(clear, neutral pronunciation)."
     )
     source_language: str = "en"                       # AWS Translate source language code
     target_language: str = "hi"                       # AWS Translate target language code (e.g. "hi", "es")
