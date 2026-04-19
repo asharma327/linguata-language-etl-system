@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-language = "italian"
+language = "german"
 if __name__ == "__main__":
     DB = {
         "host": os.environ["DB_HOST"],

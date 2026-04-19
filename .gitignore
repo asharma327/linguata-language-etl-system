@@ -125,3 +125,6 @@ docs/_build/
 *.tmp
 *.swp
 *.swo
+
+# Elastic Beanstalk: local deploy zips (keep .elasticbeanstalk/config.yml in git)
+.elasticbeanstalk/app_versions/
