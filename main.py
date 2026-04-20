@@ -241,13 +241,20 @@ def connect_to_db(config: DBConfig, use_database: bool = True):
 
 
 def resolve_cefr(filename: str, mapping: list[CefrRange] | None, fallback: str) -> str:
-    """Extract unit number from filename and return the matching CEFR level."""
+    """Extract unit or lesson index from filename and return the matching CEFR level."""
     if mapping:
         match = re.search(r"^unit(\d+)", filename, re.IGNORECASE)
         if match:
             unit = int(match.group(1))
             for r in mapping:
                 if r.min <= unit <= r.max:
+                    return r.cefr_level
+        # Italian FAST-style: "... Volume 1 - Lesson 01 ..." — map by lesson number
+        m_lesson = re.search(r"Lesson\s+(\d+)", filename, re.IGNORECASE)
+        if m_lesson:
+            lesson_n = int(m_lesson.group(1))
+            for r in mapping:
+                if r.min <= lesson_n <= r.max:
                     return r.cefr_level
     return fallback
 
@@ -630,9 +637,19 @@ def _extract_unit_number_from_filename(filename: str) -> int | None:
     """Return the unit number found in the filename, or None.
 
     Handles formats like:
-        Spanish Basic Course - Volume 2 - Unit 28C.mp3  →  28
-        unit05_listening_a.mp3                          →  5
+        Spanish Basic Course - Volume 2 - Unit 28C.mp3              →  28
+        FSI - German ... - Unit 01 1.1.mp3                        →  1
+        FSI - Italian FAST - Volume 1 - Lesson 07.mp3             →  7  (lesson index)
+        unit05_listening_a.mp3                                     →  5
     """
+    # Italian FAST: lesson number must win over "Volume 1" (otherwise every file would be 1)
+    m_lesson = re.search(r"Lesson\s+(\d+)", filename, re.IGNORECASE)
+    if m_lesson:
+        try:
+            return int(m_lesson.group(1))
+        except ValueError:
+            pass
+
     m = re.search(r"Unit\s+(\d+)", filename, re.IGNORECASE)
     if m:
         try:
@@ -653,15 +670,40 @@ def _build_listening_lesson_title(filename: str) -> str:
 
     Examples
     --------
-    Spanish Basic Course - Volume 2 - Unit 28C.mp3  →  unit28_listening_c
-    Spanish Basic Course - Volume 1 - Unit 02A.mp3  →  unit2_listening_a
+    FSI - Italian FAST - Volume 1 - Lesson 01.mp3     →  Volume 1 - Lesson 01
+    FSI ... Unit 01 1.1.mp3                           →  unit1_listening_1
+    FSI ... Unit 02 2.3.mp3                           →  unit2_listening_3
+    Spanish Basic Course - Volume 2 - Unit 28C.mp3    →  unit28_listening_c
+    Spanish Basic Course - Volume 1 - Unit 02A.mp3   →  unit2_listening_a
     some_other_file.mp3                              →  some_other_file  (fallback)
     """
     stem = Path(filename).stem
+
+    # Italian FAST (S3): "Volume 1 - Lesson 01" — store human-readable segment in DB
+    m_it = re.search(r"Volume\s+(\d+)\s+-\s+Lesson\s+(\d+)", stem, re.IGNORECASE)
+    if m_it:
+        vol = int(m_it.group(1))
+        lesson_n = int(m_it.group(2))
+        return f"Volume {vol} - Lesson {lesson_n:02d}"
+
+    # German-style (FSI): "Unit 01 1.1" → unit1_listening_1 (suffix = segment after the dot)
+    m_de = re.search(r"Unit\s+(\d+)\s+(\d+)\.(\d+)", stem, re.IGNORECASE)
+    if m_de:
+        unit_num = int(m_de.group(1))
+        minor = int(m_de.group(3))
+        return f"unit{unit_num}_listening_{minor}"
+
+    # Spanish-style: letter immediately after unit digits, e.g. Unit 02A
+    m_es = re.search(r"Unit\s+(\d+)([A-Za-z])\b", stem, re.IGNORECASE)
+    if m_es:
+        unit_num = int(m_es.group(1))
+        return f"unit{unit_num}_listening_{m_es.group(2).lower()}"
+
+    # Legacy: Unit NN optional single letter (may have nothing after Unit NN)
     m = re.search(r"Unit\s+(\d+)([A-Za-z]?)", stem, re.IGNORECASE)
     if m:
-        unit_num = int(m.group(1))          # strips leading zeros (02 → 2)
-        part = m.group(2).lower()           # 'a', 'b', 'c', or ''
+        unit_num = int(m.group(1))
+        part = m.group(2).lower()
         part_suffix = f"_{part}" if part else ""
         return f"unit{unit_num}_listening{part_suffix}"
     return stem
