@@ -364,7 +364,7 @@ def insert_lessons(body: InsertLessonsRequest):
         folder = Path(body.folder)
         if not folder.is_dir():
             raise HTTPException(status_code=400, detail=f"Folder not found: {body.folder}")
-        json_files.extend(sorted(folder.glob("*.json")))
+        json_files.extend(sorted(folder.rglob("*.json")))
 
     if body.files:
         for f in body.files:
@@ -399,7 +399,7 @@ def insert_lessons(body: InsertLessonsRequest):
 
         # --- Parse JSON ---
         try:
-            data = json.loads(json_file.read_text(encoding="utf-8"))
+            data = json.loads(json_file.read_text(encoding="utf-8-sig"))
         except Exception as e:
             file_log["status"] = "failed"
             file_log["errors"].append(f"JSON parse error: {e}")
@@ -3183,5 +3183,2092 @@ def backfill_answer_text(body: BackfillAnswerTextRequest):
         status_code=200 if all_ok else 207,
     )
 
+# =============================================================================
+#  Add to main.py  —  Rebalance grammar lessons: split each lesson's questions
+#  ~50/50 into `practice` and `learning`, converting multiple_choice questions
+#  into short_answer along the way.
+#
+#  Requires the imports already present in main.py (FastAPI, pymysql, logger,
+#  connect_to_db, DBConfig, JSONResponse, BaseModel).
+# =============================================================================
+
+
+# ----------------------------------------------------------------------------- 
+# Request model  (place near the other Pydantic models)
+# ----------------------------------------------------------------------------- 
+class RebalanceGrammarRequest(BaseModel):
+    db: DBConfig
+    lesson_ids: list[int] | None = None     # restrict to these grammar lessons; None = ALL grammar lessons
+    learning_ratio: float = 0.5             # target fraction of each lesson that should be `learning`
+    handle_orphan_practice: bool = True     # Step A: MC-type questions sitting at answer_category='practice' → learning
+    dry_run: bool = True                    # True = run everything in a transaction, verify, then ROLLBACK
+    # German rule (post-French): a question is multiple_choice when it has >1 real answer
+    # AND at least one is_correct. After this route runs, no grammar question keeps >1 answer,
+    # so grammar can only resolve to practice or learning.
+
+
+# ----------------------------------------------------------------------------- 
+# Conversion helpers
+# ----------------------------------------------------------------------------- 
+def _convert_question_to_practice(cur, question_id: int) -> int:
+    """
+    Mold an MC question into a `practice` short_answer:
+      - keep exactly ONE answer row (the correct one — lowest answer_id among
+        is_correct=1; if none correct, the lowest answer_id overall),
+      - delete every other answer row,
+      - mark the survivor is_correct=1,
+      - type='short_answer', has_answer=1.
+    Returns the number of answer rows deleted.
+    """
+    cur.execute(
+        "SELECT answer_id, is_correct FROM Answer WHERE question_id = %s ORDER BY answer_id ASC",
+        (question_id,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        # No answers at all — nothing to keep; flag as answered short_answer (edge case).
+        cur.execute(
+            "UPDATE Question SET type = 'short_answer', has_answer = 1 WHERE question_id = %s",
+            (question_id,),
+        )
+        return 0
+
+    keep_id = next((r["answer_id"] for r in rows if r["is_correct"]), rows[0]["answer_id"])
+    cur.execute(
+        "DELETE FROM Answer WHERE question_id = %s AND answer_id <> %s",
+        (question_id, keep_id),
+    )
+    deleted = cur.rowcount
+    cur.execute("UPDATE Answer SET is_correct = 1 WHERE answer_id = %s", (keep_id,))
+    cur.execute(
+        "UPDATE Question SET type = 'short_answer', has_answer = 1 WHERE question_id = %s",
+        (question_id,),
+    )
+    return deleted
+
+
+def _convert_question_to_learning(cur, question_id: int) -> int:
+    """
+    Mold an MC question into a `learning` short_answer:
+      - keep ONLY the lowest answer_id row, delete the rest,
+      - blank that survivor (answer_text='', is_correct=0),
+      - type='short_answer', has_answer=0.
+    Returns the number of answer rows deleted.
+    """
+    cur.execute(
+        "SELECT answer_id FROM Answer WHERE question_id = %s ORDER BY answer_id ASC",
+        (question_id,),
+    )
+    rows = cur.fetchall()
+    deleted = 0
+    if rows:
+        keep_id = rows[0]["answer_id"]
+        cur.execute(
+            "DELETE FROM Answer WHERE question_id = %s AND answer_id <> %s",
+            (question_id, keep_id),
+        )
+        deleted = cur.rowcount
+        cur.execute(
+            "UPDATE Answer SET answer_text = '', is_correct = 0 WHERE answer_id = %s",
+            (keep_id,),
+        )
+    cur.execute(
+        "UPDATE Question SET type = 'short_answer', has_answer = 0 WHERE question_id = %s",
+        (question_id,),
+    )
+    return deleted
+
+
+# answer_category derivation (German / post-French rule), scoped via {ids} placeholder
+_GRAMMAR_BACKFILL_SQL = """
+UPDATE Question q
+JOIN (
+    SELECT q2.question_id,
+           l.type AS lesson_type,
+           COUNT(CASE WHEN TRIM(a.answer_text) <> '' THEN a.answer_id END) AS real_answers,
+           SUM(CASE WHEN a.is_correct = 1 THEN 1 ELSE 0 END)               AS correct_count
+    FROM Question q2
+    LEFT JOIN Lesson l ON l.lesson_id   = q2.lesson_id
+    LEFT JOIN Answer a ON a.question_id = q2.question_id
+    WHERE q2.lesson_id IN ({ids})
+    GROUP BY q2.question_id, l.type
+) agg ON agg.question_id = q.question_id
+SET q.answer_category = CASE
+    WHEN agg.real_answers > 1 AND agg.correct_count >= 1 THEN 'multiple_choice'
+    WHEN agg.real_answers >= 1                            THEN 'practice'
+    WHEN agg.real_answers = 0
+         AND agg.lesson_type IN ('vocabulary','grammar')  THEN 'learning'
+    WHEN agg.real_answers = 0
+         AND agg.lesson_type IN ('reading','writing','speaking','listening') THEN 'open_ended'
+    ELSE NULL
+END
+WHERE q.lesson_id IN ({ids})
+"""
+
+
+# ----------------------------------------------------------------------------- 
+# Route
+# ----------------------------------------------------------------------------- 
+@app.post("/rebalance-grammar-categories")
+def rebalance_grammar_categories(body: RebalanceGrammarRequest):
+    """
+    Rebalance grammar-lesson questions so each lesson is ~50/50 practice/learning.
+
+    Pipeline (single transaction):
+      Step A  — convert MC-type questions currently sitting at answer_category='practice'
+                (the malformed-MC / no-correct-flag group) into `learning`.
+      Step B  — per grammar lesson: target_learning = floor(total * learning_ratio).
+                Questions already in a learning state (has_answer=0, incl. Step A output)
+                COUNT toward that target. Convert just enough of the remaining
+                multiple_choice questions to learning to reach the target; the rest
+                become practice. learning_needed is clamped to >= 0 and to the MC pool
+                size, so a lesson already over-quota on learning (e.g. 6 of 10 from
+                Step A) simply makes its remaining MC questions practice.
+      Backfill— re-derive answer_category from the new structure (proves correctness).
+      Verify  — per-lesson distribution + invariants, then COMMIT or (dry_run) ROLLBACK.
+
+    Safe: neither user_attempts nor userResponses references Answer.answer_id, so
+    deleting answer rows cannot strand user-activity data.
+    """
+    logger.info(
+        "rebalance-grammar started | db=%s lesson_ids=%s ratio=%s handle_orphan=%s dry_run=%s",
+        body.db.database, body.lesson_ids, body.learning_ratio,
+        body.handle_orphan_practice, body.dry_run,
+    )
+
+    try:
+        conn = connect_to_db(body.db)
+    except Exception as e:
+        logger.error("Could not connect to database: %s", e)
+        raise HTTPException(status_code=400, detail=f"Could not connect to database: {e}")
+
+    step_a_log: list[dict] = []
+    lesson_results: list[dict] = []
+    skipped_non_grammar: list[dict] = []
+
+    try:
+        with conn.cursor() as cur:
+            # --- Resolve in-scope grammar lessons ---
+            if body.lesson_ids:
+                fmt = ",".join(["%s"] * len(body.lesson_ids))
+                cur.execute(
+                    f"SELECT lesson_id, title, type FROM Lesson WHERE lesson_id IN ({fmt})",
+                    tuple(body.lesson_ids),
+                )
+                rows = cur.fetchall()
+                grammar_lessons = [r for r in rows if r["type"] == "grammar"]
+                skipped_non_grammar = [
+                    {"lesson_id": r["lesson_id"], "type": r["type"]}
+                    for r in rows if r["type"] != "grammar"
+                ]
+            else:
+                cur.execute("SELECT lesson_id, title, type FROM Lesson WHERE type = 'grammar'")
+                grammar_lessons = cur.fetchall()
+
+            lesson_id_list = [r["lesson_id"] for r in grammar_lessons]
+            if not lesson_id_list:
+                conn.close()
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "detail": "No in-scope grammar lessons found."},
+                )
+
+            fmt_ids = ",".join(["%s"] * len(lesson_id_list))
+            logger.info("In-scope grammar lessons: %d", len(lesson_id_list))
+
+            # =================================================================
+            # STEP A — orphan-practice MC questions → learning
+            # =================================================================
+            step_a_deleted = 0
+            if body.handle_orphan_practice:
+                cur.execute(
+                    f"""
+                    SELECT q.question_id, q.lesson_id
+                    FROM Question q
+                    WHERE q.lesson_id IN ({fmt_ids})
+                      AND q.type = 'multiple_choice'
+                      AND q.answer_category = 'practice'
+                    ORDER BY q.lesson_id, q.question_id
+                    """,
+                    tuple(lesson_id_list),
+                )
+                step_a_targets = cur.fetchall()
+                logger.info("Step A targets (MC-type @ practice): %d", len(step_a_targets))
+                for t in step_a_targets:
+                    d = _convert_question_to_learning(cur, t["question_id"])
+                    step_a_deleted += d
+                    step_a_log.append({
+                        "question_id": t["question_id"],
+                        "lesson_id": t["lesson_id"],
+                        "answers_deleted": d,
+                    })
+
+            # =================================================================
+            # STEP B — per-lesson 50/50 split of remaining MC questions
+            # =================================================================
+            step_b_deleted = 0
+            for lesson in grammar_lessons:
+                lid = lesson["lesson_id"]
+                cur.execute(
+                    "SELECT question_id, type, has_answer FROM Question "
+                    "WHERE lesson_id = %s ORDER BY question_id ASC",
+                    (lid,),
+                )
+                qs = cur.fetchall()
+                total = len(qs)
+                if total == 0:
+                    lesson_results.append({
+                        "lesson_id": lid, "title": lesson["title"], "total": 0,
+                        "status": "empty",
+                    })
+                    continue
+
+                existing_learning = sum(1 for q in qs if q["has_answer"] == 0)
+                mc_pool = [q for q in qs if q["type"] == "multiple_choice"]
+
+                target_learning = int(total * body.learning_ratio)   # floor
+                learning_needed = target_learning - existing_learning
+                if learning_needed < 0:
+                    learning_needed = 0
+                if learning_needed > len(mc_pool):
+                    learning_needed = len(mc_pool)
+
+                to_learning = mc_pool[:learning_needed]
+                to_practice = mc_pool[learning_needed:]
+
+                for q in to_learning:
+                    step_b_deleted += _convert_question_to_learning(cur, q["question_id"])
+                for q in to_practice:
+                    step_b_deleted += _convert_question_to_practice(cur, q["question_id"])
+
+                final_learning = existing_learning + len(to_learning)
+                final_practice = total - final_learning
+
+                rec = {
+                    "lesson_id": lid,
+                    "title": lesson["title"],
+                    "total": total,
+                    "target_learning": target_learning,
+                    "existing_learning_before_stepB": existing_learning,
+                    "mc_pool": len(mc_pool),
+                    "converted_to_learning": len(to_learning),
+                    "converted_to_practice": len(to_practice),
+                    "final_learning": final_learning,
+                    "final_practice": final_practice,
+                    "lopsided": final_learning > final_practice,  # over-quota learning (e.g. Step A heavy)
+                }
+                lesson_results.append(rec)
+                logger.info(
+                    "[lesson %d] total=%d target_L=%d existing_L=%d pool=%d -> L+%d / P+%d => %dL/%dP%s",
+                    lid, total, target_learning, existing_learning, len(mc_pool),
+                    len(to_learning), len(to_practice), final_learning, final_practice,
+                    "  *LOPSIDED*" if rec["lopsided"] else "",
+                )
+
+            # =================================================================
+            # RE-RUN BACKFILL (derive answer_category from new structure)
+            # =================================================================
+            backfill_sql = _GRAMMAR_BACKFILL_SQL.format(ids=fmt_ids)
+            cur.execute(backfill_sql, tuple(lesson_id_list) + tuple(lesson_id_list))
+            backfill_updated = cur.rowcount
+            logger.info("Backfill updated rows: %d", backfill_updated)
+
+            # =================================================================
+            # VERIFICATION (computed on real post-change state, pre-commit)
+            # =================================================================
+            cur.execute(
+                f"SELECT lesson_id, answer_category, COUNT(*) AS cnt "
+                f"FROM Question WHERE lesson_id IN ({fmt_ids}) "
+                f"GROUP BY lesson_id, answer_category ORDER BY lesson_id",
+                tuple(lesson_id_list),
+            )
+            per_lesson_categories = cur.fetchall()
+
+            cur.execute(
+                f"SELECT answer_category, COUNT(*) AS cnt "
+                f"FROM Question WHERE lesson_id IN ({fmt_ids}) GROUP BY answer_category",
+                tuple(lesson_id_list),
+            )
+            overall_categories = {r["answer_category"]: r["cnt"] for r in cur.fetchall()}
+
+            cur.execute(
+                f"SELECT COUNT(*) AS c FROM Question "
+                f"WHERE lesson_id IN ({fmt_ids}) AND type = 'multiple_choice'",
+                tuple(lesson_id_list),
+            )
+            remaining_mc_type = cur.fetchone()["c"]
+
+            cur.execute(
+                f"SELECT COUNT(*) AS c FROM Question "
+                f"WHERE lesson_id IN ({fmt_ids}) AND answer_category = 'multiple_choice'",
+                tuple(lesson_id_list),
+            )
+            remaining_mc_category = cur.fetchone()["c"]
+
+            cur.execute(
+                f"SELECT COUNT(*) AS c FROM Question "
+                f"WHERE lesson_id IN ({fmt_ids}) AND answer_category IS NULL",
+                tuple(lesson_id_list),
+            )
+            null_category = cur.fetchone()["c"]
+
+            # Invariant: every in-scope grammar question must end with exactly ONE answer row
+            cur.execute(
+                f"""
+                SELECT COUNT(*) AS c FROM (
+                    SELECT q.question_id, COUNT(a.answer_id) AS n
+                    FROM Question q
+                    LEFT JOIN Answer a ON a.question_id = q.question_id
+                    WHERE q.lesson_id IN ({fmt_ids})
+                    GROUP BY q.question_id
+                    HAVING n <> 1
+                ) t
+                """,
+                tuple(lesson_id_list),
+            )
+            questions_not_single_answer = cur.fetchone()["c"]
+
+            verification = {
+                "overall_categories": overall_categories,
+                "remaining_multiple_choice_type": remaining_mc_type,        # expect 0
+                "remaining_multiple_choice_category": remaining_mc_category,  # expect 0
+                "questions_with_null_category": null_category,               # expect 0
+                "questions_not_exactly_one_answer": questions_not_single_answer,  # expect 0
+                "lopsided_lessons": [r["lesson_id"] for r in lesson_results if r.get("lopsided")],
+            }
+
+            checks_pass = (
+                remaining_mc_type == 0
+                and remaining_mc_category == 0
+                and null_category == 0
+                and questions_not_single_answer == 0
+            )
+
+            # =================================================================
+            # COMMIT / ROLLBACK gate
+            # =================================================================
+            if body.dry_run:
+                conn.rollback()
+                committed = False
+                logger.info("DRY RUN — rolled back. checks_pass=%s", checks_pass)
+            else:
+                if not checks_pass:
+                    conn.rollback()
+                    committed = False
+                    logger.error("Verification FAILED — rolled back instead of committing. %s", verification)
+                else:
+                    conn.commit()
+                    committed = True
+                    logger.info("COMMITTED.")
+
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        logger.error("rebalance-grammar failed, rolled back: %s\n%s", e, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Rebalance failed (rolled back): {e}")
+
+    conn.close()
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "ok" if checks_pass else "verification_failed",
+            "committed": committed,
+            "dry_run": body.dry_run,
+            "summary": {
+                "grammar_lessons_in_scope": len(lesson_id_list),
+                "skipped_non_grammar": skipped_non_grammar,
+                "step_a_converted": len(step_a_log),
+                "step_a_answers_deleted": step_a_deleted,
+                "step_b_answers_deleted": step_b_deleted,
+                "backfill_rows_updated": backfill_updated,
+            },
+            "verification": verification,
+            "lessons": lesson_results,
+            "step_a": step_a_log,
+        },
+    )
+
+
+# =============================================================================
+#  Export a QA workbook (.xlsx) for one language DB.
+#
+#  One workbook per language. One worksheet per unit (unit1, unit2, ...).
+#  Within a unit tab, content is laid out top-down:
+#     UNIT heading
+#       TYPE heading (vocabulary, grammar, reading, writing, listening, speaking)
+#         LESSON heading (Lesson.title, plus per-lesson url(s) where relevant)
+#           per-type column block + rows
+#
+#  Requires openpyxl (pip install openpyxl).  Reuses connect_to_db / DBConfig /
+#  logger / JSONResponse / HTTPException / json / re / Path already in main.py.
+# =============================================================================
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+# Fixed display order of type sections within a unit
+_TYPE_ORDER = ["vocabulary", "grammar", "reading", "writing", "listening", "speaking"]
+
+# Styling
+_UNIT_FILL   = PatternFill("solid", fgColor="1F4E78")  # dark blue
+_TYPE_FILL   = PatternFill("solid", fgColor="2E75B6")  # medium blue
+_LESSON_FILL = PatternFill("solid", fgColor="BDD7EE")  # light blue
+_HEADER_FILL = PatternFill("solid", fgColor="D9D9D9")  # grey column headers
+_WHITE_BOLD  = Font(name="Arial", bold=True, color="FFFFFF")
+_DARK_BOLD   = Font(name="Arial", bold=True, color="000000")
+_NORMAL      = Font(name="Arial")
+_WRAP_TOP    = Alignment(wrap_text=True, vertical="top")
+_WRAP_CENTER = Alignment(wrap_text=True, vertical="top", horizontal="center")
+
+
+class ExportQAWorkbookRequest(BaseModel):
+    db: DBConfig
+    language_label: str                 # used for the filename, e.g. "spanish"
+    units: list[int] | None = None      # specific unit numbers; None = all units found
+    output_dir: str = "/tmp"            # where the .xlsx is written
+
+
+def _ids_json(lesson_id=None, question_id=None, answer_id=None, article_id=None) -> str:
+    return json.dumps({
+        "lesson_id": lesson_id,
+        "question_id": question_id,
+        "answer_id": answer_id,
+        "article_id": article_id,
+    })
+
+
+def _unit_num(title: str):
+    m = re.match(r"^unit(\d+)", title or "", re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def _fetch_articles(cur, lesson_id):
+    cur.execute(
+        "SELECT article_id, sequence_id, content FROM Article "
+        "WHERE lesson_id = %s ORDER BY sequence_id ASC, article_id ASC",
+        (lesson_id,),
+    )
+    return cur.fetchall()
+
+
+def _fetch_questions(cur, lesson_id):
+    cur.execute(
+        "SELECT question_id, sequence_id, question_text, answer_category "
+        "FROM Question WHERE lesson_id = %s ORDER BY sequence_id ASC, question_id ASC",
+        (lesson_id,),
+    )
+    return cur.fetchall()
+
+
+def _fetch_answers(cur, question_id):
+    cur.execute(
+        "SELECT answer_id, answer_text, is_correct FROM Answer "
+        "WHERE question_id = %s ORDER BY answer_id ASC",
+        (question_id,),
+    )
+    return cur.fetchall()
+
+
+def _question_image_url(cur, question_id):
+    cur.execute(
+        "SELECT image_url FROM Image WHERE question_id = %s ORDER BY image_id ASC LIMIT 1",
+        (question_id,),
+    )
+    r = cur.fetchone()
+    return r["image_url"] if r else ""
+
+
+def _question_audio_url(cur, question_id):
+    cur.execute(
+        "SELECT audio_url FROM Audio WHERE question_id = %s ORDER BY audio_id ASC LIMIT 1",
+        (question_id,),
+    )
+    r = cur.fetchone()
+    return r["audio_url"] if r else ""
+
+
+def _lesson_audio_url(cur, lesson_id):
+    cur.execute(
+        "SELECT audio_url FROM Audio WHERE lesson_id = %s ORDER BY audio_id ASC LIMIT 1",
+        (lesson_id,),
+    )
+    r = cur.fetchone()
+    return r["audio_url"] if r else ""
+
+
+def _lesson_image_url(cur, lesson_id):
+    cur.execute(
+        "SELECT image_url FROM Image WHERE lesson_id = %s ORDER BY image_id ASC LIMIT 1",
+        (lesson_id,),
+    )
+    r = cur.fetchone()
+    return r["image_url"] if r else ""
+
+
+def _lesson_video_url(cur, lesson_id):
+    cur.execute(
+        "SELECT v.url FROM Video v "
+        "JOIN VideoLesson vl ON vl.video_id = v.video_id "
+        "WHERE vl.lesson_id = %s ORDER BY v.video_id ASC LIMIT 1",
+        (lesson_id,),
+    )
+    r = cur.fetchone()
+    return r["url"] if r else ""
+
+
+def _correct_index(answers):
+    """1-based positions (by answer_id ascending) of is_correct=1 rows; '' if none."""
+    idxs = [str(i) for i, a in enumerate(answers, start=1) if a["is_correct"]]
+    return ",".join(idxs)
+
+
+def _write_row(ws, row, values, font=None, fill=None, wrap=False, center_cols=None):
+    center_cols = center_cols or set()
+    for col, val in enumerate(values, start=1):
+        c = ws.cell(row=row, column=col, value=val)
+        c.font = font if font else _NORMAL
+        if fill:
+            c.fill = fill
+        if col in center_cols:
+            c.alignment = _WRAP_CENTER
+        elif wrap:
+            c.alignment = _WRAP_TOP
+    return row + 1
+
+
+def _heading(ws, row, text, fill, font, span=8):
+    c = ws.cell(row=row, column=1, value=text)
+    c.font = font
+    c.fill = fill
+    for col in range(2, span + 1):
+        ws.cell(row=row, column=col).fill = fill
+    return row + 1
+
+
+# --- per-type block writers; each returns the next free row -------------------
+
+def _block_vocabulary(ws, row, cur, lesson):
+    lid = lesson["lesson_id"]
+    row = _write_row(ws, row,
+        ["answer_category", "sequence_id", "question_text", "answer_text",
+         "image_url", "audio_url", "ids"],
+        font=_DARK_BOLD, fill=_HEADER_FILL, center_cols={2})
+    for q in _fetch_questions(cur, lid):
+        answers = _fetch_answers(cur, q["question_id"])
+        ans = answers[0] if answers else None
+        row = _write_row(ws, row, [
+            q["answer_category"], q["sequence_id"], q["question_text"],
+            ans["answer_text"] if ans else "",
+            _question_image_url(cur, q["question_id"]),
+            _question_audio_url(cur, q["question_id"]),
+            _ids_json(lid, q["question_id"], ans["answer_id"] if ans else None, None),
+        ], wrap=True, center_cols={2})
+    return row
+
+
+def _block_writing(ws, row, cur, lesson):
+    lid = lesson["lesson_id"]
+    row = _write_row(ws, row,
+        ["answer_category", "sequence_id", "question_text", "answer_text", "ids"],
+        font=_DARK_BOLD, fill=_HEADER_FILL, center_cols={2})
+    for q in _fetch_questions(cur, lid):
+        answers = _fetch_answers(cur, q["question_id"])
+        ans = answers[0] if answers else None
+        row = _write_row(ws, row, [
+            q["answer_category"], q["sequence_id"], q["question_text"],
+            ans["answer_text"] if ans else "",
+            _ids_json(lid, q["question_id"], ans["answer_id"] if ans else None, None),
+        ], wrap=True, center_cols={2})
+    return row
+
+
+def _block_speaking(ws, row, cur, lesson):
+    lid = lesson["lesson_id"]
+    row = _write_row(ws, row, ["article_id", "article_text"],
+                     font=_DARK_BOLD, fill=_HEADER_FILL)
+    for a in _fetch_articles(cur, lid):
+        row = _write_row(ws, row, [a["article_id"], a["content"]], wrap=True)
+    return row
+
+
+def _block_reading(ws, row, cur, lesson):
+    """Article block | gap | MCQ block. image_url shown once at lesson heading."""
+    lid = lesson["lesson_id"]
+    # Article block + gap col + Q&A header in one header row
+    row = _write_row(ws, row, [
+        "article_id", "article_text", "",
+        "answer_category", "sequence_id", "question_text",
+        "Answer 1", "Answer 2", "Answer 3", "Answer 4", "Correct Answer", "ids",
+    ], font=_DARK_BOLD, fill=_HEADER_FILL, center_cols={5})
+
+    articles = _fetch_articles(cur, lid)
+    questions = _fetch_questions(cur, lid)
+    n = max(len(articles), len(questions))
+    for i in range(n):
+        art = articles[i] if i < len(articles) else None
+        q = questions[i] if i < len(questions) else None
+        left = [art["article_id"], art["content"]] if art else ["", ""]
+        if q:
+            answers = _fetch_answers(cur, q["question_id"])
+            opts = [answers[j]["answer_text"] if j < len(answers) else "" for j in range(4)]
+            correct_ans_id = next((a["answer_id"] for a in answers if a["is_correct"]), None)
+            right = [q["answer_category"], q["sequence_id"], q["question_text"],
+                     *opts, _correct_index(answers),
+                     _ids_json(lid, q["question_id"], correct_ans_id,
+                               art["article_id"] if art else None)]
+        else:
+            right = ["", "", "", "", "", "", "", "",
+                     _ids_json(lid, None, None, art["article_id"] if art else None)]
+        row = _write_row(ws, row, [*left, "", *right], wrap=True, center_cols={5})
+    return row
+
+
+def _block_listening(ws, row, cur, lesson):
+    """One image_url + audio_url per lesson (shown at heading); MCQ rows below."""
+    lid = lesson["lesson_id"]
+    row = _write_row(ws, row, [
+        "answer_category", "sequence_id", "question_text",
+        "Answer 1", "Answer 2", "Answer 3", "Answer 4", "Correct Answer", "ids",
+    ], font=_DARK_BOLD, fill=_HEADER_FILL, center_cols={2})
+    for q in _fetch_questions(cur, lid):
+        answers = _fetch_answers(cur, q["question_id"])
+        opts = [answers[j]["answer_text"] if j < len(answers) else "" for j in range(4)]
+        correct_ans_id = next((a["answer_id"] for a in answers if a["is_correct"]), None)
+        row = _write_row(ws, row, [
+            q["answer_category"], q["sequence_id"], q["question_text"],
+            *opts, _correct_index(answers),
+            _ids_json(lid, q["question_id"], correct_ans_id, None),
+        ], wrap=True, center_cols={2})
+    return row
+
+
+def _block_grammar(ws, row, cur, lesson):
+    """One video_url per lesson (shown at heading). Article block | gap | Q&A (short_answer)."""
+    lid = lesson["lesson_id"]
+    row = _write_row(ws, row, [
+        "article_id", "article_text", "",
+        "answer_category", "sequence_id", "question_text", "answer_text", "ids",
+    ], font=_DARK_BOLD, fill=_HEADER_FILL, center_cols={5})
+
+    articles = _fetch_articles(cur, lid)
+    questions = _fetch_questions(cur, lid)
+    n = max(len(articles), len(questions))
+    for i in range(n):
+        art = articles[i] if i < len(articles) else None
+        q = questions[i] if i < len(questions) else None
+        left = [art["article_id"], art["content"]] if art else ["", ""]
+        if q:
+            answers = _fetch_answers(cur, q["question_id"])
+            ans = answers[0] if answers else None
+            right = [q["answer_category"], q["sequence_id"], q["question_text"],
+                     ans["answer_text"] if ans else "",
+                     _ids_json(lid, q["question_id"], ans["answer_id"] if ans else None,
+                               art["article_id"] if art else None)]
+        else:
+            right = ["", "", "", "",
+                     _ids_json(lid, None, None, art["article_id"] if art else None)]
+        row = _write_row(ws, row, [*left, "", *right], wrap=True, center_cols={5})
+    return row
+
+
+_BLOCK_WRITERS = {
+    "vocabulary": _block_vocabulary,
+    "writing": _block_writing,
+    "speaking": _block_speaking,
+    "reading": _block_reading,
+    "listening": _block_listening,
+    "grammar": _block_grammar,
+}
+
+
+@app.post("/export-qa-workbook")
+def export_qa_workbook(body: ExportQAWorkbookRequest):
+    """
+    Build one .xlsx for a language DB: a tab per unit, per-type lesson blocks.
+    Pass `units` to export a single unit (e.g. [1]) or a subset; omit for all.
+    """
+    logger.info("export-qa-workbook started | db=%s label=%s units=%s",
+                body.db.database, body.language_label, body.units)
+    try:
+        conn = connect_to_db(body.db)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not connect to database: {e}")
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT lesson_id, title, type FROM Lesson "
+                "WHERE title REGEXP '^unit[0-9]' ORDER BY title ASC"
+            )
+            lessons = cur.fetchall()
+
+            # Group lessons by unit number
+            units: dict[int, list[dict]] = {}
+            for l in lessons:
+                u = _unit_num(l["title"])
+                if u is None:
+                    continue
+                if body.units is not None and u not in body.units:
+                    continue
+                units.setdefault(u, []).append(l)
+
+            if not units:
+                conn.close()
+                raise HTTPException(status_code=404, detail="No matching units found.")
+
+            wb = Workbook()
+            wb.remove(wb.active)
+
+            for unit_num in sorted(units.keys()):
+                ws = wb.create_sheet(title=f"unit{unit_num}")
+                # column widths
+                ws.column_dimensions["A"].width = 16
+                ws.column_dimensions["B"].width = 50
+                for col in "CDEFGHIJKL":
+                    ws.column_dimensions[col].width = 24
+                row = 1
+                row = _heading(ws, row, f"UNIT {unit_num}", _UNIT_FILL, _WHITE_BOLD, span=12)
+                row += 1
+
+                unit_lessons = units[unit_num]
+                for ltype in _TYPE_ORDER:
+                    type_lessons = sorted(
+                        [l for l in unit_lessons if l["type"] == ltype],
+                        key=lambda x: x["title"],
+                    )
+                    if not type_lessons:
+                        continue
+                    row = _heading(ws, row, ltype.upper(), _TYPE_FILL, _WHITE_BOLD, span=12)
+
+                    for lesson in type_lessons:
+                        lid = lesson["lesson_id"]
+                        # Lesson heading + per-lesson url(s) where relevant
+                        extras = []
+                        if ltype == "listening":
+                            extras = [f"image_url: {_lesson_image_url(cur, lid)}",
+                                      f"audio_url: {_lesson_audio_url(cur, lid)}"]
+                        elif ltype == "reading":
+                            extras = [f"image_url: {_lesson_image_url(cur, lid)}"]
+                        elif ltype == "grammar":
+                            extras = [f"video_url: {_lesson_video_url(cur, lid)}"]
+                        head = f"Lesson: {lesson['title']}"
+                        if extras:
+                            head += "   |   " + "   |   ".join(extras)
+                        row = _heading(ws, row, head, _LESSON_FILL, _DARK_BOLD, span=12)
+
+                        writer = _BLOCK_WRITERS.get(ltype)
+                        if writer:
+                            row = writer(ws, row, cur, lesson)
+                        row += 1  # spacer between lessons
+                    row += 1  # spacer between type sections
+
+                ws.freeze_panes = "A2"
+
+        os.makedirs(body.output_dir, exist_ok=True)
+        safe_label = re.sub(r"[^A-Za-z0-9_-]", "_", body.language_label)
+        suffix = "" if body.units is None else "_units_" + "-".join(str(u) for u in sorted(body.units))
+        out_path = os.path.join(body.output_dir, f"qa_{safe_label}{suffix}.xlsx")
+        wb.save(out_path)
+        logger.info("Workbook written: %s (%d unit tabs)", out_path, len(units))
+
+    except HTTPException:
+        conn.close()
+        raise
+    except Exception as e:
+        conn.close()
+        logger.error("export-qa-workbook failed: %s\n%s", e, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Export failed: {e}")
+
+    conn.close()
+    return JSONResponse(content={
+        "status": "ok",
+        "language": body.language_label,
+        "units_exported": sorted(units.keys()),
+        "tabs": len(units),
+        "output_path": out_path,
+    })
+
+    # =============================================================================
+#  Streaming delete routes for QA cleanup.
+#
+#  /delete-questions : delete specific questions + everything attached
+#  /delete-lessons   : delete whole lessons + everything under them
+#
+#  Both STREAM progress live as NDJSON (one JSON object per line) so you can
+#  watch each step execute in real time instead of waiting for completion.
+#
+#  dry_run=True (default) does every delete inside a transaction, streams the
+#  rowcounts, then ROLLS BACK — nothing is removed until you send dry_run=false.
+#
+#  Child-first deletion order (FKs in this schema are inconsistent, so we delete
+#  every dependent explicitly rather than trusting ON DELETE CASCADE):
+#     Image / Audio / userResponses / user_attempts / Answer  ->  Question
+#     ... then LessonImages / lesson-level Image+Audio / VideoLesson(+orphan Video)
+#     ... then Question / Article  ->  Lesson
+#
+#  Requires: from fastapi.responses import StreamingResponse
+# =============================================================================
+
+from fastapi.responses import StreamingResponse
+
+
+class DeleteQuestionsRequest(BaseModel):
+    db: DBConfig
+    question_ids: list[int]
+    keep_user_history: bool = False     # if True, leave userResponses / user_attempts rows intact
+    dry_run: bool = True
+
+
+class DeleteLessonsRequest(BaseModel):
+    db: DBConfig
+    lesson_ids: list[int]
+    keep_user_history: bool = False
+    dry_run: bool = True
+
+
+def _emit(event: str, **fields) -> str:
+    """Serialize one progress event as a single NDJSON line."""
+    payload = {"event": event}
+    payload.update(fields)
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def _in_clause(ids):
+    return ",".join(["%s"] * len(ids))
+
+
+# ----------------------------------------------------------------------------- 
+# DELETE QUESTIONS
+# ----------------------------------------------------------------------------- 
+@app.post("/delete-questions")
+def delete_questions(body: DeleteQuestionsRequest):
+
+    def stream():
+        if not body.question_ids:
+            yield _emit("error", message="question_ids is empty")
+            return
+
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        qids = body.question_ids
+        fmt = _in_clause(qids)
+        deleted_totals = {}
+        yield _emit("start", action="delete-questions", count=len(qids),
+                    dry_run=body.dry_run, keep_user_history=body.keep_user_history)
+        logger.info("delete-questions started | n=%d dry_run=%s", len(qids), body.dry_run)
+
+        try:
+            with conn.cursor() as cur:
+                # preview which actually exist
+                cur.execute(f"SELECT question_id FROM Question WHERE question_id IN ({fmt})", tuple(qids))
+                found = [r["question_id"] for r in cur.fetchall()]
+                missing = [q for q in qids if q not in found]
+                yield _emit("preview", existing=len(found), missing=missing)
+
+                steps = [
+                    ("Image (by question)",  f"DELETE FROM Image WHERE question_id IN ({fmt})", tuple(qids)),
+                    ("Audio (by question)",  f"DELETE FROM Audio WHERE question_id IN ({fmt})", tuple(qids)),
+                ]
+                if not body.keep_user_history:
+                    steps += [
+                        ("userResponses", f"DELETE FROM userResponses WHERE question_id IN ({fmt})", tuple(qids)),
+                        ("user_attempts", f"DELETE FROM user_attempts WHERE current_question_id IN ({fmt})", tuple(qids)),
+                    ]
+                steps += [
+                    ("Answer",   f"DELETE FROM Answer WHERE question_id IN ({fmt})", tuple(qids)),
+                    ("Question", f"DELETE FROM Question WHERE question_id IN ({fmt})", tuple(qids)),
+                ]
+
+                for label, sql, params in steps:
+                    cur.execute(sql, params)
+                    n = cur.rowcount
+                    deleted_totals[label] = n
+                    logger.info("delete-questions | %s -> %d rows", label, n)
+                    yield _emit("step", table=label, deleted=n)
+
+            if body.dry_run:
+                conn.rollback()
+                committed = False
+                yield _emit("rollback", reason="dry_run")
+            else:
+                conn.commit()
+                committed = True
+                yield _emit("commit")
+
+            yield _emit("summary", committed=committed, dry_run=body.dry_run,
+                        deleted=deleted_totals)
+            logger.info("delete-questions finished | committed=%s totals=%s", committed, deleted_totals)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("delete-questions failed, rolled back: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+# ----------------------------------------------------------------------------- 
+# DELETE LESSONS
+# ----------------------------------------------------------------------------- 
+@app.post("/delete-lessons")
+def delete_lessons(body: DeleteLessonsRequest):
+
+    def stream():
+        if not body.lesson_ids:
+            yield _emit("error", message="lesson_ids is empty")
+            return
+
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        grand_totals: dict = {}
+        yield _emit("start", action="delete-lessons", count=len(body.lesson_ids),
+                    dry_run=body.dry_run, keep_user_history=body.keep_user_history)
+        logger.info("delete-lessons started | n=%d dry_run=%s", len(body.lesson_ids), body.dry_run)
+
+        def bump(label, n):
+            grand_totals[label] = grand_totals.get(label, 0) + n
+
+        try:
+            for lid in body.lesson_ids:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT lesson_id, title, type FROM Lesson WHERE lesson_id = %s", (lid,))
+                    lesson = cur.fetchone()
+                    if not lesson:
+                        yield _emit("lesson_skipped", lesson_id=lid, reason="not found")
+                        continue
+
+                    cur.execute("SELECT question_id FROM Question WHERE lesson_id = %s", (lid,))
+                    qids = [r["question_id"] for r in cur.fetchall()]
+                    yield _emit("lesson_start", lesson_id=lid, title=lesson["title"],
+                                type=lesson["type"], questions=len(qids))
+
+                    per_lesson = {}
+
+                    # 1) children of this lesson's questions
+                    if qids:
+                        qfmt = _in_clause(qids)
+                        qsteps = [
+                            ("Image(q)", f"DELETE FROM Image WHERE question_id IN ({qfmt})"),
+                            ("Audio(q)", f"DELETE FROM Audio WHERE question_id IN ({qfmt})"),
+                        ]
+                        if not body.keep_user_history:
+                            qsteps += [
+                                ("userResponses", f"DELETE FROM userResponses WHERE question_id IN ({qfmt})"),
+                                ("user_attempts", f"DELETE FROM user_attempts WHERE current_question_id IN ({qfmt})"),
+                            ]
+                        qsteps += [("Answer", f"DELETE FROM Answer WHERE question_id IN ({qfmt})")]
+                        for label, sql in qsteps:
+                            cur.execute(sql, tuple(qids))
+                            n = cur.rowcount
+                            per_lesson[label] = n; bump(label, n)
+                            yield _emit("step", lesson_id=lid, table=label, deleted=n)
+
+                    # 2) lesson-level media
+                    lvl = [
+                        ("LessonImages", "DELETE FROM LessonImages WHERE lesson_id = %s"),
+                        ("Image(lesson)", "DELETE FROM Image WHERE lesson_id = %s"),
+                        ("Audio(lesson)", "DELETE FROM Audio WHERE lesson_id = %s"),
+                        ("VideoLesson", "DELETE FROM VideoLesson WHERE lesson_id = %s"),
+                    ]
+                    for label, sql in lvl:
+                        cur.execute(sql, (lid,))
+                        n = cur.rowcount
+                        per_lesson[label] = n; bump(label, n)
+                        yield _emit("step", lesson_id=lid, table=label, deleted=n)
+
+                    # orphaned Video rows (no VideoLesson points to them anymore)
+                    cur.execute(
+                        "DELETE v FROM Video v "
+                        "LEFT JOIN VideoLesson vl ON vl.video_id = v.video_id "
+                        "WHERE vl.video_id IS NULL"
+                    )
+                    n = cur.rowcount
+                    per_lesson["Video(orphan)"] = n; bump("Video(orphan)", n)
+                    yield _emit("step", lesson_id=lid, table="Video(orphan)", deleted=n)
+
+                    # 3) questions + articles
+                    for label, sql in [
+                        ("Question", "DELETE FROM Question WHERE lesson_id = %s"),
+                        ("Article",  "DELETE FROM Article WHERE lesson_id = %s"),
+                    ]:
+                        cur.execute(sql, (lid,))
+                        n = cur.rowcount
+                        per_lesson[label] = n; bump(label, n)
+                        yield _emit("step", lesson_id=lid, table=label, deleted=n)
+
+                    # 4) the lesson
+                    cur.execute("DELETE FROM Lesson WHERE lesson_id = %s", (lid,))
+                    n = cur.rowcount
+                    per_lesson["Lesson"] = n; bump("Lesson", n)
+                    yield _emit("step", lesson_id=lid, table="Lesson", deleted=n)
+
+                    yield _emit("lesson_done", lesson_id=lid, deleted=per_lesson)
+                    logger.info("delete-lessons | lesson %d done | %s", lid, per_lesson)
+
+            if body.dry_run:
+                conn.rollback()
+                committed = False
+                yield _emit("rollback", reason="dry_run")
+            else:
+                conn.commit()
+                committed = True
+                yield _emit("commit")
+
+            yield _emit("summary", committed=committed, dry_run=body.dry_run,
+                        grand_totals=grand_totals)
+            logger.info("delete-lessons finished | committed=%s totals=%s", committed, grand_totals)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("delete-lessons failed, rolled back: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+# =============================================================================
+#  /regenerate-lesson-media
+#
+#  Re-hydrate media for lessons after a re-insert, OR top-up media for a few
+#  newly-added questions, WITHOUT needing to know database-generated ids.
+#
+#  Select lessons by (priority order):
+#     lesson_ids  -> explicit ids (if you happen to know them)
+#     titles      -> exact Lesson.title match  (best for re-insertion: titles are stable)
+#     units       -> every unitN_ lesson in those unit numbers
+#
+#  Optional question_sequence_ids: narrow vocab work to specific questions by their
+#  JSON sequence_id (stable & human-known), resolved to current question_id at runtime.
+#
+#  Behaviour: SKIP-IF-PRESENT. Generates media only for questions/lessons that are
+#  currently missing it; never overwrites existing media. This makes whole-lesson
+#  re-hydrate and partial top-up the same safe call.
+#
+#  Per type:
+#     vocabulary -> images (+link) and audio (+link) for questions missing them
+#     reading    -> link per-lesson image via unit-image ingest (if missing)
+#     listening  -> link per-question images via unit-image ingest (if missing)
+#     grammar    -> NO generation; emits a manual_todo checklist (audio is generated
+#                   separately, video is made by an external tool, then linked)
+#     speaking   -> nothing (text-only; no media in schema)
+#
+#  Streams NDJSON progress (one JSON object per line) so you can watch it live.
+#  dry_run=True (default): generation routines are NOT called; it reports the plan
+#  (what's missing, what it would generate) and rolls back any lookups.
+#
+#  Reuses existing helpers/classes already in main.py:
+#     VocabToPictures, _resize_to_256_png_bytes, _upload_to_s3_public, _safe_slug,
+#     _insert_image_row, _make_s3_client, _generate_tts_bytes, _translate_text,
+#     _insert_vocab_audio_row, _extract_unit_num_from_title, connect_to_db, _emit
+#  Requires: from fastapi.responses import StreamingResponse  (already imported)
+# =============================================================================
+
+
+class RegenerateLessonMediaRequest(BaseModel):
+    db: DBConfig
+    # --- selection (use ONE; checked in this priority order) ---
+    lesson_ids: list[int] | None = None
+    titles: list[str] | None = None
+    units: list[int] | None = None
+    # --- optional narrowing for partial top-up (vocab questions by JSON sequence_id) ---
+    question_sequence_ids: list[int] | None = None
+    # --- S3 / credentials (same fields as the other generation routes) ---
+    s3_bucket: str
+    s3_image_prefix: str = "images"
+    s3_audio_prefix: str = "audio"
+    aws_region: str = "us-east-1"
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    openai_api_key: str | None = None
+    # vocab audio translation (only used when an answer is blank)
+    translate_vocab_audio: bool = False
+    source_language: str = "en"
+    target_language: str = "es"
+    tts_model: str = "gpt-4o-mini-tts"
+    voice: str = "alloy"
+    tts_instructions: str | None = "Speak slowly and clearly with a warm, friendly, teacher-like tone."
+    translate_images: bool = False     # passed to VocabToPictures.generate_one
+    dry_run: bool = True
+
+
+@app.post("/regenerate-lesson-media")
+def regenerate_lesson_media(body: RegenerateLessonMediaRequest):
+
+    def stream():
+        # --- resolve selection to current lessons ---
+        if not (body.lesson_ids or body.titles or body.units):
+            yield _emit("error", message="Provide one of lesson_ids, titles, or units")
+            return
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        yield _emit("start", action="regenerate-lesson-media", dry_run=body.dry_run,
+                    selector=("lesson_ids" if body.lesson_ids else
+                              "titles" if body.titles else "units"))
+
+        try:
+            with conn.cursor() as cur:
+                if body.lesson_ids:
+                    fmt = ",".join(["%s"] * len(body.lesson_ids))
+                    cur.execute(
+                        f"SELECT lesson_id, title, type FROM Lesson WHERE lesson_id IN ({fmt})",
+                        tuple(body.lesson_ids),
+                    )
+                    lessons = cur.fetchall()
+                elif body.titles:
+                    fmt = ",".join(["%s"] * len(body.titles))
+                    cur.execute(
+                        f"SELECT lesson_id, title, type FROM Lesson WHERE title IN ({fmt})",
+                        tuple(body.titles),
+                    )
+                    lessons = cur.fetchall()
+                else:  # units
+                    likes = " OR ".join(["title LIKE %s"] * len(body.units))
+                    params = [f"unit{u}\\_%" for u in body.units]
+                    cur.execute(
+                        f"SELECT lesson_id, title, type FROM Lesson WHERE {likes} ORDER BY title",
+                        tuple(params),
+                    )
+                    lessons = cur.fetchall()
+
+            if not lessons:
+                yield _emit("error", message="No lessons matched the selection")
+                conn.close()
+                return
+
+            yield _emit("resolved", count=len(lessons),
+                        lessons=[{"lesson_id": l["lesson_id"], "title": l["title"],
+                                  "type": l["type"]} for l in lessons])
+
+            # --- shared clients (only built when not dry_run) ---
+            s3 = None
+            img_gen = None
+            openai_client = None
+            translate_client = None
+            if not body.dry_run:
+                s3 = _make_s3_client(body.aws_region, body.aws_access_key_id, body.aws_secret_access_key)
+                img_gen = VocabToPictures(api_key=body.openai_api_key, model="gpt-image-1", size="1024x1024")
+                openai_client = OpenAI(api_key=body.openai_api_key or os.getenv("OPENAI_API_KEY"))
+                tkw = {"region_name": body.aws_region}
+                if body.aws_access_key_id and body.aws_secret_access_key:
+                    tkw["aws_access_key_id"] = body.aws_access_key_id
+                    tkw["aws_secret_access_key"] = body.aws_secret_access_key
+                translate_client = boto3.client("translate", **tkw)
+
+            grand = {"images": 0, "audio": 0, "skipped": 0, "manual_grammar": 0, "errors": 0}
+
+            for lesson in lessons:
+                lid = lesson["lesson_id"]
+                ltype = lesson["type"]
+                title = lesson["title"]
+                yield _emit("lesson_start", lesson_id=lid, title=title, type=ltype)
+
+                # ---------------- speaking: nothing ----------------
+                if ltype == "speaking":
+                    yield _emit("lesson_done", lesson_id=lid, note="speaking is text-only; no media")
+                    continue
+
+                # ---------------- grammar: manual checklist ----------------
+                if ltype == "grammar":
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT v.url FROM Video v JOIN VideoLesson vl ON vl.video_id=v.video_id "
+                            "WHERE vl.lesson_id=%s LIMIT 1", (lid,))
+                        has_video = cur.fetchone() is not None
+                    grand["manual_grammar"] += 1
+                    yield _emit("manual_todo", lesson_id=lid, title=title,
+                                video_linked=has_video,
+                                steps=[
+                                    "run /generate-grammar-audio for this lesson",
+                                    "create the video with the external tool (named with THIS lesson_id)",
+                                    "upload the .mp4 to S3, then run /link-grammar-videos",
+                                ])
+                    yield _emit("lesson_done", lesson_id=lid)
+                    continue
+
+                # ---------------- vocabulary: images + audio ----------------
+                if ltype == "vocabulary":
+                    # questions missing an image / missing audio (skip-if-present)
+                    with conn.cursor() as cur:
+                        seq_filter = ""
+                        params = [lid]
+                        if body.question_sequence_ids:
+                            seqfmt = ",".join(["%s"] * len(body.question_sequence_ids))
+                            seq_filter = f" AND q.sequence_id IN ({seqfmt})"
+                            params += list(body.question_sequence_ids)
+
+                        cur.execute(
+                            f"""SELECT q.question_id, q.sequence_id, q.question_text,
+                                       (SELECT COUNT(*) FROM Image i WHERE i.question_id=q.question_id) AS has_img,
+                                       (SELECT COUNT(*) FROM Audio a WHERE a.question_id=q.question_id) AS has_aud
+                                FROM Question q
+                                WHERE q.lesson_id=%s{seq_filter}
+                                ORDER BY q.sequence_id""",
+                            tuple(params),
+                        )
+                        qrows = cur.fetchall()
+
+                    need_img = [q for q in qrows if not q["has_img"]]
+                    need_aud = [q for q in qrows if not q["has_aud"]]
+                    yield _emit("vocab_plan", lesson_id=lid,
+                                questions=len(qrows), need_image=len(need_img), need_audio=len(need_aud))
+
+                    if body.dry_run:
+                        grand["skipped"] += len(qrows)
+                        yield _emit("lesson_done", lesson_id=lid, note="dry_run: no generation")
+                        continue
+
+                    # --- images ---
+                    for q in need_img:
+                        try:
+                            gen = img_gen.generate_one(
+                                word=q["question_text"],
+                                translate=body.translate_images,
+                            )
+                            if not gen or not gen.get("image_bytes"):
+                                raise RuntimeError("no image returned")
+                            png = _resize_to_256_png_bytes(gen["image_bytes"])
+                            key = f"{body.s3_image_prefix}/{lid}_{q['question_id']}_{_safe_slug(title)}.png"
+                            url = _upload_to_s3_public(png, key, body.s3_bucket, body.aws_region,
+                                                       body.aws_access_key_id, body.aws_secret_access_key)
+                            meta = {"original_text": gen["original_text"],
+                                    "translated_text": gen["translated_text"],
+                                    "s3_key": key, "public_url": url, "lesson_title": title}
+                            _insert_image_row(conn, lesson_id=lid, question_id=q["question_id"],
+                                              image_url=url, image_metadata_json=json.dumps(meta, ensure_ascii=False))
+                            conn.commit()
+                            grand["images"] += 1
+                            yield _emit("image", lesson_id=lid, question_id=q["question_id"], url=url)
+                        except Exception as e:
+                            conn.rollback(); grand["errors"] += 1
+                            yield _emit("image_error", lesson_id=lid, question_id=q["question_id"], error=str(e))
+
+                    # --- audio ---
+                    for q in need_aud:
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "SELECT answer_text FROM Answer WHERE question_id=%s AND is_correct=1 LIMIT 1",
+                                    (q["question_id"],))
+                                arow = cur.fetchone()
+                                answer_text = (arow["answer_text"] if arow else "") or ""
+
+                            if not answer_text.strip() and body.translate_vocab_audio:
+                                translated = _translate_text(translate_client, q["question_text"],
+                                                             body.source_language, body.target_language)
+                                with conn.cursor() as cur:
+                                    cur.execute("SELECT COUNT(*) AS c FROM Answer WHERE question_id=%s",
+                                                (q["question_id"],))
+                                    if cur.fetchone()["c"] > 0:
+                                        cur.execute("UPDATE Answer SET answer_text=%s WHERE question_id=%s AND is_correct=1",
+                                                    (translated, q["question_id"]))
+                                    else:
+                                        cur.execute("INSERT INTO Answer (lesson_id, question_id, answer_text, is_correct) "
+                                                    "VALUES (%s,%s,%s,1)", (lid, q["question_id"], translated))
+                                answer_text = translated
+
+                            speak = answer_text.strip() or q["question_text"]
+                            audio_bytes = _generate_tts_bytes(openai_client, speak,
+                                                              body.tts_model, body.voice, body.tts_instructions)
+                            key = f"{body.s3_audio_prefix}/{lid}_{q['question_id']}_{_safe_slug(title)}.mp3"
+                            s3.put_object(Bucket=body.s3_bucket, Key=key, Body=audio_bytes, ContentType="audio/mpeg")
+                            url = f"https://{body.s3_bucket}.s3.{body.aws_region}.amazonaws.com/{key}"
+                            _insert_vocab_audio_row(conn, lid, q["question_id"], q["sequence_id"], url,
+                                                    body.tts_model, body.voice)
+                            conn.commit()
+                            grand["audio"] += 1
+                            yield _emit("audio", lesson_id=lid, question_id=q["question_id"], url=url)
+                        except Exception as e:
+                            conn.rollback(); grand["errors"] += 1
+                            yield _emit("audio_error", lesson_id=lid, question_id=q["question_id"], error=str(e))
+
+                    yield _emit("lesson_done", lesson_id=lid)
+                    continue
+
+                # ---------------- reading / listening: image linking ----------------
+                if ltype in ("reading", "listening"):
+                    # report whether a lesson-level / question-level image already exists;
+                    # actual linking is handled by /ingest-unit-images (unit-scoped).
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT COUNT(*) AS c FROM Image WHERE lesson_id=%s", (lid,))
+                        has_img = cur.fetchone()["c"]
+                    unit = _extract_unit_num_from_title(title)
+                    yield _emit("link_via_ingest", lesson_id=lid, type=ltype, unit=unit,
+                                images_present=has_img,
+                                note=f"run /ingest-unit-images with units=[{unit}] to (re)link the unit image")
+                    yield _emit("lesson_done", lesson_id=lid)
+                    continue
+
+                # ---------------- unknown type ----------------
+                yield _emit("lesson_done", lesson_id=lid, note=f"no media rule for type '{ltype}'")
+
+            if body.dry_run:
+                conn.rollback()
+            yield _emit("summary", dry_run=body.dry_run, totals=grand)
+            logger.info("regenerate-lesson-media finished | dry_run=%s totals=%s", body.dry_run, grand)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("regenerate-lesson-media failed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e))
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+# =============================================================================
+#  /insert-content
+#
+#  Append question(s) and/or article(s) to an EXISTING lesson, without touching
+#  the rest of the lesson. Reuses the same JSON item shapes as /insert-lessons.
+#
+#  You send ONLY the new items, not the whole lesson:
+#     - new questions  -> "questions_and_answers": [ {question_text, answers:[...]} , ... ]
+#     - new articles   -> "articles": [ {text} , ... ]
+#
+#  Target the lesson by `title` (stable across re-inserts) or `lesson_id`.
+#
+#  Auto-handled (do NOT put in payload):
+#     - sequence_id   : appended as max(sequence_id)+1, incrementing per item
+#                       (you MAY pass sequence_id on an item to force a value)
+#     - lesson_id     : filled from the resolved lesson
+#     - has_answer    : set from whether the question has a real (non-blank) answer
+#     - answer_category : derived (learning/open_ended/practice/multiple_choice)
+#
+#  Streams NDJSON progress. dry_run=True (default) inserts inside a transaction,
+#  streams what it WOULD create, then ROLLS BACK.
+#
+#  Does NOT generate media — follow with /regenerate-lesson-media (by title +
+#  the new question sequence_ids) to create images/audio for new vocab questions.
+#
+#  Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse.
+# =============================================================================
+
+
+class InsertContentRequest(BaseModel):
+    db: DBConfig
+    # --- target (use ONE) ---
+    title: str | None = None
+    lesson_id: int | None = None
+    # --- new content (same shapes as /insert-lessons) ---
+    questions_and_answers: list[dict] | None = None
+    articles: list[dict] | None = None
+    dry_run: bool = True
+
+
+def _derive_answer_category(lesson_type: str, real_answers: int, correct_count: int) -> str | None:
+    """Same rule as the grammar backfill, generalized for any lesson type."""
+    if real_answers > 1 and correct_count >= 1:
+        return "multiple_choice"
+    if real_answers >= 1:
+        return "practice"
+    if real_answers == 0 and lesson_type in ("vocabulary", "grammar"):
+        return "learning"
+    if real_answers == 0 and lesson_type in ("reading", "writing", "speaking", "listening"):
+        return "open_ended"
+    return None
+
+
+@app.post("/insert-content")
+def insert_content(body: InsertContentRequest):
+
+    def stream():
+        if not body.title and not body.lesson_id:
+            yield _emit("error", message="Provide a target: title or lesson_id")
+            return
+        if not body.questions_and_answers and not body.articles:
+            yield _emit("error", message="Provide questions_and_answers and/or articles to insert")
+            return
+
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        yield _emit("start", action="insert-content", dry_run=body.dry_run)
+
+        try:
+            with conn.cursor() as cur:
+                # --- resolve target lesson ---
+                if body.lesson_id:
+                    cur.execute("SELECT lesson_id, title, type FROM Lesson WHERE lesson_id=%s", (body.lesson_id,))
+                else:
+                    cur.execute("SELECT lesson_id, title, type FROM Lesson WHERE title=%s", (body.title,))
+                lesson = cur.fetchone()
+                if not lesson:
+                    yield _emit("error", message="Target lesson not found")
+                    conn.close(); return
+
+                lid = lesson["lesson_id"]
+                ltype = lesson["type"]
+                yield _emit("resolved", lesson_id=lid, title=lesson["title"], type=ltype)
+
+                # --- current max sequence ids ---
+                cur.execute("SELECT COALESCE(MAX(sequence_id),0) AS m FROM Article WHERE lesson_id=%s", (lid,))
+                art_seq = cur.fetchone()["m"]
+                cur.execute("SELECT COALESCE(MAX(sequence_id),0) AS m FROM Question WHERE lesson_id=%s", (lid,))
+                q_seq = cur.fetchone()["m"]
+
+                inserted = {"articles": [], "questions": []}
+
+                # --- articles ---
+                for art in (body.articles or []):
+                    text = art.get("text", art.get("content", ""))
+                    seq = art.get("sequence_id")
+                    if seq is None:
+                        art_seq += 1
+                        seq = art_seq
+                    cur.execute(
+                        "INSERT INTO Article (lesson_id, sequence_id, content) VALUES (%s,%s,%s)",
+                        (lid, seq, text),
+                    )
+                    aid = cur.lastrowid
+                    inserted["articles"].append({"article_id": aid, "sequence_id": seq})
+                    yield _emit("article_inserted", lesson_id=lid, article_id=aid, sequence_id=seq)
+
+                # --- questions (+ answers) ---
+                for qa in (body.questions_and_answers or []):
+                    question_text = qa.get("question_text") or qa.get("question", "")
+                    seq = qa.get("sequence_id")
+                    if seq is None:
+                        q_seq += 1
+                        seq = q_seq
+
+                    # normalize answers into a list of {text, is_correct}
+                    answers = []
+                    if "answers" in qa and isinstance(qa["answers"], list):
+                        for ans in qa["answers"]:
+                            answers.append({
+                                "text": ans.get("answer_text") or ans.get("answer") or ans.get("text", ""),
+                                "is_correct": int(ans.get("is_correct", False)),
+                            })
+                    elif "answer" in qa:
+                        raw = qa["answer"]
+                        if isinstance(raw, str):
+                            answers.append({"text": raw, "is_correct": int(qa.get("is_correct", True))})
+                        elif isinstance(raw, dict):
+                            answers.append({"text": raw.get("text") or raw.get("answer", ""),
+                                            "is_correct": int(raw.get("is_correct", True))})
+                        elif isinstance(raw, list):
+                            for ans in raw:
+                                answers.append({"text": ans.get("answer", ""),
+                                                "is_correct": int(ans.get("is_correct", True))})
+
+                    real_answers = sum(1 for a in answers if a["text"].strip() != "")
+                    correct_count = sum(1 for a in answers if a["is_correct"])
+                    has_answer = 1 if real_answers >= 1 else 0
+                    qtype = qa.get("type") or ("multiple_choice" if len(answers) > 1 else "short_answer")
+                    category = _derive_answer_category(ltype, real_answers, correct_count)
+
+                    cur.execute(
+                        "INSERT INTO Question (lesson_id, sequence_id, question_text, type, has_answer, answer_category) "
+                        "VALUES (%s,%s,%s,%s,%s,%s)",
+                        (lid, seq, question_text, qtype, has_answer, category),
+                    )
+                    qid = cur.lastrowid
+                    for a in answers:
+                        cur.execute(
+                            "INSERT INTO Answer (lesson_id, question_id, answer_text, is_correct) VALUES (%s,%s,%s,%s)",
+                            (lid, qid, a["text"], a["is_correct"]),
+                        )
+                    inserted["questions"].append({
+                        "question_id": qid, "sequence_id": seq, "type": qtype,
+                        "answers": len(answers), "has_answer": has_answer, "answer_category": category,
+                    })
+                    yield _emit("question_inserted", lesson_id=lid, question_id=qid, sequence_id=seq,
+                                type=qtype, answers=len(answers), answer_category=category)
+
+                # keep Lesson.has_question correct if we added the first questions
+                if inserted["questions"]:
+                    cur.execute("UPDATE Lesson SET has_question=1 WHERE lesson_id=%s", (lid,))
+
+            if body.dry_run:
+                conn.rollback()
+                committed = False
+                yield _emit("rollback", reason="dry_run")
+            else:
+                conn.commit()
+                committed = True
+                yield _emit("commit")
+
+            new_q_seqs = [q["sequence_id"] for q in inserted["questions"]]
+            yield _emit("summary", committed=committed, dry_run=body.dry_run,
+                        lesson_id=lid, title=lesson["title"],
+                        articles_inserted=len(inserted["articles"]),
+                        questions_inserted=len(inserted["questions"]),
+                        new_question_sequence_ids=new_q_seqs,
+                        next_step=(
+                            "run /regenerate-lesson-media with this title and "
+                            f"question_sequence_ids={new_q_seqs} to create media for new vocab questions"
+                            if ltype == "vocabulary" and new_q_seqs else None
+                        ))
+            logger.info("insert-content | lesson=%s committed=%s +%dq +%da",
+                        lid, committed, len(inserted["questions"]), len(inserted["articles"]))
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("insert-content failed, rolled back: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+# =============================================================================
+#  Add to main.py  —  /rebalance-grammar-practice-learning
+#
+#  Spanish situation: each grammar lesson is currently EITHER all-practice OR
+#  all-learning. Rebalance each lesson to ~50/50.
+#
+#  Per lesson (target_learning = floor(total/2)):
+#     - all-practice lesson  -> blank the FIRST half  -> learning
+#                               (keep one row, answer_text='', is_correct=0, has_answer=0)
+#     - all-learning lesson   -> GENERATE answers for the SECOND half -> practice
+#                               (fill the blank row via LLM, is_correct=1, has_answer=1)
+#     - mixed lesson          -> generalises: move just enough to hit target_learning,
+#                               blanking practice->learning or generating learning->practice
+#
+#  learning -> practice REQUIRES inventing an answer (the original was deleted when the
+#  question became learning). Answers are generated from question_text via OpenAI and are
+#  GUESSES — every generated question_id is reported so QA can verify them.
+#
+#  After mutation, answer_category is re-derived from structure (the grammar backfill).
+#
+#  Streams NDJSON. dry_run=True (default): reports the plan (no LLM calls, no writes),
+#  then rolls back.
+#
+#  Reuses: connect_to_db, DBConfig, logger, _emit, StreamingResponse,
+#          _GRAMMAR_BACKFILL_SQL, OpenAI, os.
+# =============================================================================
+
+
+class RebalancePracticeLearningRequest(BaseModel):
+    db: DBConfig
+    lesson_ids: list[int] | None = None     # restrict to these grammar lessons; None = ALL grammar
+    learning_ratio: float = 0.5
+    openai_api_key: str | None = None       # falls back to OPENAI_API_KEY env var
+    model: str = "gpt-4o-mini"
+    dry_run: bool = True
+
+
+def _generate_grammar_answer(client, model: str, question_text: str) -> str:
+    """Ask the LLM for the single correct answer to a grammar question. Returns plain text."""
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": (
+                "You are a precise language-learning answer key. Given a grammar practice "
+                "question, reply with ONLY the single correct answer — no explanation, no "
+                "punctuation beyond what the answer itself needs, no quotes, no preamble."
+            )},
+            {"role": "user", "content": question_text},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _to_learning(cur, question_id: int) -> int:
+    """Blank a question into learning: keep lowest answer_id row, blank it, has_answer=0."""
+    cur.execute("SELECT answer_id FROM Answer WHERE question_id=%s ORDER BY answer_id ASC", (question_id,))
+    rows = cur.fetchall()
+    deleted = 0
+    if rows:
+        keep = rows[0]["answer_id"]
+        cur.execute("DELETE FROM Answer WHERE question_id=%s AND answer_id<>%s", (question_id, keep))
+        deleted = cur.rowcount
+        cur.execute("UPDATE Answer SET answer_text='', is_correct=0 WHERE answer_id=%s", (keep,))
+    cur.execute("UPDATE Question SET type='short_answer', has_answer=0 WHERE question_id=%s", (question_id,))
+    return deleted
+
+
+def _to_practice_with_answer(cur, question_id: int, lesson_id: int, answer_text: str) -> None:
+    """Fill a (blank) question's answer to make it practice. Keeps exactly one row."""
+    cur.execute("SELECT answer_id FROM Answer WHERE question_id=%s ORDER BY answer_id ASC", (question_id,))
+    rows = cur.fetchall()
+    if rows:
+        keep = rows[0]["answer_id"]
+        cur.execute("DELETE FROM Answer WHERE question_id=%s AND answer_id<>%s", (question_id, keep))
+        cur.execute("UPDATE Answer SET answer_text=%s, is_correct=1 WHERE answer_id=%s", (answer_text, keep))
+    else:
+        cur.execute(
+            "INSERT INTO Answer (lesson_id, question_id, answer_text, is_correct) VALUES (%s,%s,%s,1)",
+            (lesson_id, question_id, answer_text),
+        )
+    cur.execute("UPDATE Question SET type='short_answer', has_answer=1 WHERE question_id=%s", (question_id,))
+
+
+@app.post("/rebalance-grammar-practice-learning")
+def rebalance_grammar_practice_learning(body: RebalancePracticeLearningRequest):
+
+    def stream():
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        yield _emit("start", action="rebalance-practice-learning",
+                    dry_run=body.dry_run, learning_ratio=body.learning_ratio)
+
+        client = None
+        if not body.dry_run:
+            client = OpenAI(api_key=body.openai_api_key or os.getenv("OPENAI_API_KEY"))
+
+        generated_ids = []
+        grand = {"to_learning": 0, "to_practice_generated": 0, "lessons": 0, "errors": 0}
+
+        try:
+            with conn.cursor() as cur:
+                if body.lesson_ids:
+                    fmt = ",".join(["%s"] * len(body.lesson_ids))
+                    cur.execute(f"SELECT lesson_id, title FROM Lesson WHERE type='grammar' AND lesson_id IN ({fmt})",
+                                tuple(body.lesson_ids))
+                else:
+                    cur.execute("SELECT lesson_id, title FROM Lesson WHERE type='grammar' ORDER BY title")
+                grammar = cur.fetchall()
+
+            if not grammar:
+                yield _emit("error", message="No grammar lessons in scope")
+                conn.close(); return
+
+            lesson_id_list = [g["lesson_id"] for g in grammar]
+            yield _emit("resolved", lessons=len(grammar))
+
+            for g in grammar:
+                lid = g["lesson_id"]
+                # current state of each question: is it learning (no real answer) or practice?
+                cur = conn.cursor()
+                cur.execute(
+                    """SELECT q.question_id, q.question_text,
+                              COUNT(CASE WHEN TRIM(a.answer_text) <> '' THEN a.answer_id END) AS real_answers
+                       FROM Question q
+                       LEFT JOIN Answer a ON a.question_id = q.question_id
+                       WHERE q.lesson_id = %s
+                       GROUP BY q.question_id, q.question_text
+                       ORDER BY q.question_id ASC""",
+                    (lid,),
+                )
+                qs = cur.fetchall()
+                cur.close()
+                total = len(qs)
+                if total == 0:
+                    continue
+                grand["lessons"] += 1
+
+                learning_q = [q for q in qs if q["real_answers"] == 0]
+                practice_q = [q for q in qs if q["real_answers"] >= 1]
+                target_learning = int(total * body.learning_ratio)
+
+                plan = {"lesson_id": lid, "title": g["title"], "total": total,
+                        "current_learning": len(learning_q), "current_practice": len(practice_q),
+                        "target_learning": target_learning}
+
+                # decide moves
+                make_learning = []   # practice -> learning (blank)
+                make_practice = []   # learning -> practice (generate)
+
+                if len(learning_q) < target_learning:
+                    # need more learning: blank the first (target - current) practice questions
+                    need = target_learning - len(learning_q)
+                    make_learning = practice_q[:need]
+                elif len(learning_q) > target_learning:
+                    # too much learning: generate answers for the excess (turn into practice)
+                    excess = len(learning_q) - target_learning
+                    # "second half as practice" -> take from the end of the learning list
+                    make_practice = learning_q[-excess:]
+
+                plan["will_blank_to_learning"] = len(make_learning)
+                plan["will_generate_to_practice"] = len(make_practice)
+                yield _emit("lesson_plan", **plan)
+
+                if body.dry_run:
+                    continue
+
+                cur = conn.cursor()
+                # practice -> learning (cheap, no LLM)
+                for q in make_learning:
+                    _to_learning(cur, q["question_id"])
+                    grand["to_learning"] += 1
+                    yield _emit("blanked", lesson_id=lid, question_id=q["question_id"])
+
+                # learning -> practice (LLM-generated answer)
+                for q in make_practice:
+                    try:
+                        ans = _generate_grammar_answer(client, body.model, q["question_text"])
+                        if not ans:
+                            raise RuntimeError("LLM returned empty answer")
+                        _to_practice_with_answer(cur, q["question_id"], lid, ans)
+                        grand["to_practice_generated"] += 1
+                        generated_ids.append(q["question_id"])
+                        yield _emit("generated", lesson_id=lid, question_id=q["question_id"],
+                                    answer=ans)
+                    except Exception as e:
+                        grand["errors"] += 1
+                        yield _emit("generate_error", lesson_id=lid, question_id=q["question_id"], error=str(e))
+                conn.commit()
+                cur.close()
+
+            # re-derive answer_category from new structure
+            if not body.dry_run:
+                fmt_ids = ",".join(["%s"] * len(lesson_id_list))
+                with conn.cursor() as cur:
+                    cur.execute(_GRAMMAR_BACKFILL_SQL.format(ids=fmt_ids),
+                                tuple(lesson_id_list) + tuple(lesson_id_list))
+                    backfilled = cur.rowcount
+                conn.commit()
+                yield _emit("backfill", rows_updated=backfilled)
+
+                # verification
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT answer_category, COUNT(*) AS c FROM Question "
+                        f"WHERE lesson_id IN ({fmt_ids}) GROUP BY answer_category",
+                        tuple(lesson_id_list))
+                    cats = {r["answer_category"]: r["c"] for r in cur.fetchall()}
+                yield _emit("verification", overall_categories=cats)
+
+            if body.dry_run:
+                conn.rollback()
+
+            yield _emit("summary", dry_run=body.dry_run, totals=grand,
+                        generated_question_ids=generated_ids,
+                        note="generated_question_ids contain AI-written answers — QA should verify them")
+            logger.info("rebalance-practice-learning done | dry_run=%s totals=%s", body.dry_run, grand)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("rebalance-practice-learning failed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+# =============================================================================
+#  Add to main.py  —  /sync-vocab-lesson
+#
+#  Reconcile a RE-EXTRACTED vocabulary lesson against the existing DB lesson,
+#  IN PLACE, reusing correct images and only paying to regenerate what changed.
+#
+#  Per lesson (matched by title), one LLM call matches questions by MEANING:
+#     - PERFECT (matched + identical text) -> nothing changes (image + audio kept)
+#     - FUZZY   (matched + text differs)   -> update question_text & answer_text;
+#                                             KEEP image; DELETE audio row (so it regenerates)
+#     - NEW     (new question, no match)   -> insert question + answer (image+audio later)
+#     - REMOVED (db question, no match)    -> delete it + its image/audio links
+#
+#  The LLM only matches by meaning using index labels (D1.., N1..) and returns
+#  index pairs — it never sees ids and never handles data. We decide perfect-vs-fuzzy
+#  ourselves by comparing the actual text. One-to-one is enforced: a reused index is
+#  treated as NOT matched (so it becomes NEW / REMOVED) and logged.
+#
+#  This route does NO media generation. Afterwards run /regenerate-lesson-media by
+#  title with the reported question_sequence_ids: NEW questions get image+audio,
+#  FUZZY questions get audio regenerated (image already present is skipped).
+#
+#  Streams NDJSON. dry_run=True (default): makes the (cheap) LLM call so you can
+#  judge the matching, reports every fuzzy/new/removed decision, but writes nothing.
+#
+#  Input: re-extracted JSON files (same shape as /insert-lessons): each file has
+#  "title" and "questions_and_answers": [{question_text, answers:[{answer_text}]}].
+#
+#  Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse / OpenAI / os / Path.
+# =============================================================================
+
+
+class SyncVocabLessonRequest(BaseModel):
+    db: DBConfig
+    folder: str | None = None          # directory of re-extracted JSON files
+    files: list[str] | None = None     # or explicit file paths
+    model: str = "gpt-4o-mini"
+    openai_api_key: str | None = None
+    keep_user_history: bool = False    # if True, don't delete userResponses/user_attempts for removed questions
+    dry_run: bool = True
+
+
+def _norm_text(s: str) -> str:
+    """Light normalization for the perfect-vs-fuzzy decision: trim + collapse whitespace."""
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _llm_match_questions(client, model: str, db_texts: list[str], new_texts: list[str]) -> list[dict]:
+    """
+    Ask the LLM to match by meaning. db_texts/new_texts are plain strings; we label them
+    D1.. and N1.. in the prompt. Returns list of {"db": "D3", "new": "N5"}.
+    """
+    db_block = "\n".join(f"D{i+1}: {t}" for i, t in enumerate(db_texts))
+    new_block = "\n".join(f"N{i+1}: {t}" for i, t in enumerate(new_texts))
+    system = (
+        "You match vocabulary items between two lists by MEANING. Two entries match if they "
+        "refer to the same vocabulary item even if the wording differs slightly (e.g. 'Dog' vs "
+        "'The Dog', or a small spelling/accent difference). Be conservative: only pair items you "
+        "are confident are the same item. Return ONLY JSON."
+    )
+    user = (
+        f"DB LIST:\n{db_block}\n\n"
+        f"NEW LIST:\n{new_block}\n\n"
+        "Return a JSON array of matched pairs, each like {\"db\":\"D1\",\"new\":\"N2\"}. "
+        "Each D label and each N label may appear AT MOST ONCE. Omit anything with no confident match. "
+        "No prose, no code fences."
+    )
+    resp = client.chat.completions.create(
+        model=model, temperature=0,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+    )
+    content = (resp.choices[0].message.content or "").strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*", "", content)
+        content = re.sub(r"\s*```$", "", content)
+    data = json.loads(content)
+    if not isinstance(data, list):
+        raise ValueError("LLM did not return a JSON array of pairs")
+    return data
+
+
+@app.post("/sync-vocab-lesson")
+def sync_vocab_lesson(body: SyncVocabLessonRequest):
+
+    def stream():
+        # gather files
+        files: list[Path] = []
+        if body.folder:
+            p = Path(body.folder)
+            if not p.is_dir():
+                yield _emit("error", message=f"Folder not found: {body.folder}"); return
+            files.extend(sorted(p.glob("*.json")))
+        if body.files:
+            for f in body.files:
+                fp = Path(f)
+                if fp.is_file() and fp not in files:
+                    files.append(fp)
+        if not files:
+            yield _emit("error", message="No re-extracted JSON files provided"); return
+
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}"); return
+
+        client = OpenAI(api_key=body.openai_api_key or os.getenv("OPENAI_API_KEY"))
+
+        yield _emit("start", action="sync-vocab-lesson", files=len(files), dry_run=body.dry_run)
+
+        grand = {"perfect": 0, "fuzzy": 0, "new": 0, "removed": 0,
+                 "duplicates_ignored": 0, "lessons": 0, "errors": 0}
+        regen_plan = []  # [{title, question_sequence_ids: [...]}]
+
+        try:
+            for fp in files:
+                try:
+                    data = json.loads(fp.read_text(encoding="utf-8-sig"))
+                except Exception as e:
+                    grand["errors"] += 1
+                    yield _emit("file_error", file=fp.name, error=f"JSON parse: {e}")
+                    continue
+
+                title = data.get("title")
+                new_qas = data.get("questions_and_answers", []) or []
+                if not title:
+                    grand["errors"] += 1
+                    yield _emit("file_error", file=fp.name, error="missing title")
+                    continue
+
+                # resolve existing lesson by title
+                with conn.cursor() as cur:
+                    cur.execute("SELECT lesson_id, type FROM Lesson WHERE title=%s", (title,))
+                    lrow = cur.fetchone()
+                if not lrow:
+                    grand["errors"] += 1
+                    yield _emit("lesson_error", title=title, error="lesson not found in DB")
+                    continue
+                if lrow["type"] != "vocabulary":
+                    yield _emit("lesson_error", title=title, error=f"lesson type is '{lrow['type']}', expected vocabulary")
+                    continue
+                lid = lrow["lesson_id"]
+
+                # fetch DB questions + their single answer + media presence
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT q.question_id, q.sequence_id, q.question_text,
+                                  (SELECT a.answer_id FROM Answer a WHERE a.question_id=q.question_id
+                                   ORDER BY a.answer_id ASC LIMIT 1) AS answer_id,
+                                  (SELECT COUNT(*) FROM Audio au WHERE au.question_id=q.question_id) AS has_aud
+                           FROM Question q WHERE q.lesson_id=%s ORDER BY q.question_id ASC""",
+                        (lid,),
+                    )
+                    db_q = cur.fetchall()
+
+                # new questions: extract text + answer text
+                new_q = []
+                for qa in new_qas:
+                    qtext = qa.get("question_text") or qa.get("question", "")
+                    ans = ""
+                    if isinstance(qa.get("answers"), list) and qa["answers"]:
+                        a0 = qa["answers"][0]
+                        ans = a0.get("answer_text") or a0.get("answer") or a0.get("text", "")
+                    elif isinstance(qa.get("answer"), str):
+                        ans = qa["answer"]
+                    new_q.append({"question_text": qtext, "answer_text": ans})
+
+                db_texts = [r["question_text"] for r in db_q]
+                new_texts = [q["question_text"] for q in new_q]
+                yield _emit("lesson_start", title=title, lesson_id=lid,
+                            db_questions=len(db_q), new_questions=len(new_q))
+
+                # --- LLM match (always, even dry_run) ---
+                try:
+                    pairs = _llm_match_questions(client, body.model, db_texts, new_texts)
+                except Exception as e:
+                    grand["errors"] += 1
+                    yield _emit("lesson_error", title=title, error=f"LLM match failed: {e}")
+                    continue
+
+                # resolve pairs to indices, enforce one-to-one
+                used_d, used_n = set(), set()
+                matches = []  # (db_idx, new_idx)
+                for p in pairs:
+                    d = str(p.get("db", "")); n = str(p.get("new", ""))
+                    md = re.match(r"D(\d+)$", d); mn = re.match(r"N(\d+)$", n)
+                    if not md or not mn:
+                        continue
+                    di = int(md.group(1)) - 1; ni = int(mn.group(1)) - 1
+                    if not (0 <= di < len(db_q)) or not (0 <= ni < len(new_q)):
+                        continue
+                    if di in used_d or ni in used_n:
+                        grand["duplicates_ignored"] += 1
+                        yield _emit("duplicate_ignored", title=title, db=d, new=n)
+                        continue
+                    used_d.add(di); used_n.add(ni)
+                    matches.append((di, ni))
+
+                # classify
+                perfect, fuzzy = [], []
+                for di, ni in matches:
+                    if _norm_text(db_q[di]["question_text"]) == _norm_text(new_q[ni]["question_text"]):
+                        perfect.append((di, ni))
+                    else:
+                        fuzzy.append((di, ni))
+                new_only = [i for i in range(len(new_q)) if i not in used_n]
+                removed = [i for i in range(len(db_q)) if i not in used_d]
+
+                yield _emit("llm_matched", title=title,
+                            perfect=len(perfect), fuzzy=len(fuzzy),
+                            new=len(new_only), removed=len(removed))
+
+                lesson_regen_seqs = []
+
+                # --- apply ---
+                cur = conn.cursor()
+
+                # next sequence id for appends
+                next_seq = (max([r["sequence_id"] for r in db_q], default=0)) + 1
+
+                # FUZZY: update text, delete audio row (keep image)
+                for di, ni in fuzzy:
+                    dbq = db_q[di]; nq = new_q[ni]
+                    yield _emit("fuzzy", title=title, question_id=dbq["question_id"],
+                                sequence_id=dbq["sequence_id"],
+                                old_text=dbq["question_text"], new_text=nq["question_text"],
+                                action="update text, keep image, regenerate audio")
+                    if not body.dry_run:
+                        cur.execute("UPDATE Question SET question_text=%s WHERE question_id=%s",
+                                    (nq["question_text"], dbq["question_id"]))
+                        if dbq["answer_id"]:
+                            cur.execute("UPDATE Answer SET answer_text=%s WHERE answer_id=%s",
+                                        (nq["answer_text"], dbq["answer_id"]))
+                        else:
+                            cur.execute("INSERT INTO Answer (lesson_id, question_id, answer_text, is_correct) "
+                                        "VALUES (%s,%s,%s,1)", (lid, dbq["question_id"], nq["answer_text"]))
+                        # drop audio link so regenerate recreates it
+                        cur.execute("DELETE FROM Audio WHERE question_id=%s", (dbq["question_id"],))
+                    grand["fuzzy"] += 1
+                    lesson_regen_seqs.append(dbq["sequence_id"])
+
+                # NEW: insert question + answer (append)
+                for ni in new_only:
+                    nq = new_q[ni]
+                    seq = next_seq; next_seq += 1
+                    yield _emit("new", title=title, sequence_id=seq,
+                                question_text=nq["question_text"], action="insert, generate image+audio")
+                    if not body.dry_run:
+                        cur.execute(
+                            "INSERT INTO Question (lesson_id, sequence_id, question_text, type, has_answer, answer_category) "
+                            "VALUES (%s,%s,%s,'short_answer',1,'practice')",
+                            (lid, seq, nq["question_text"]),
+                        )
+                        qid = cur.lastrowid
+                        cur.execute("INSERT INTO Answer (lesson_id, question_id, answer_text, is_correct) "
+                                    "VALUES (%s,%s,%s,1)", (lid, qid, nq["answer_text"]))
+                    grand["new"] += 1
+                    lesson_regen_seqs.append(seq)
+
+                # REMOVED: delete db question + media + (optionally) user rows
+                for di in removed:
+                    dbq = db_q[di]
+                    yield _emit("removed", title=title, question_id=dbq["question_id"],
+                                sequence_id=dbq["sequence_id"], text=dbq["question_text"],
+                                action="delete question + image + audio links")
+                    if not body.dry_run:
+                        qid = dbq["question_id"]
+                        cur.execute("DELETE FROM Image WHERE question_id=%s", (qid,))
+                        cur.execute("DELETE FROM Audio WHERE question_id=%s", (qid,))
+                        if not body.keep_user_history:
+                            cur.execute("DELETE FROM userResponses WHERE question_id=%s", (qid,))
+                            cur.execute("DELETE FROM user_attempts WHERE current_question_id=%s", (qid,))
+                        cur.execute("DELETE FROM Answer WHERE question_id=%s", (qid,))
+                        cur.execute("DELETE FROM Question WHERE question_id=%s", (qid,))
+                    grand["removed"] += 1
+
+                grand["perfect"] += len(perfect)
+                grand["lessons"] += 1
+
+                if body.dry_run:
+                    conn.rollback()
+                else:
+                    conn.commit()
+                cur.close()
+
+                yield _emit("lesson_summary", title=title,
+                            perfect=len(perfect), fuzzy=len(fuzzy),
+                            new=len(new_only), removed=len(removed),
+                            regenerate_sequence_ids=sorted(lesson_regen_seqs))
+                if lesson_regen_seqs:
+                    regen_plan.append({"title": title,
+                                       "question_sequence_ids": sorted(lesson_regen_seqs)})
+
+            yield _emit("summary", dry_run=body.dry_run, totals=grand,
+                        regenerate_plan=regen_plan,
+                        note="run /regenerate-lesson-media per title with these sequence_ids "
+                             "(NEW -> image+audio, FUZZY -> audio only, image kept)")
+            logger.info("sync-vocab-lesson done | dry_run=%s totals=%s", body.dry_run, grand)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("sync-vocab-lesson failed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 lambda_handler = Mangum(app)
