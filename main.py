@@ -118,6 +118,7 @@ class GenerateListeningQuestionsRequest(BaseModel):
 
 class GenerateVocabAudioRequest(BaseModel):
     db: DBConfig
+    titles: list[str] | None = None 
     s3_bucket: str
     s3_prefix: str                                    # S3 prefix where MP3s are uploaded
     aws_region: str = "us-east-1"
@@ -1547,170 +1548,377 @@ def generate_listening_questions(body: GenerateListeningQuestionsRequest):
     )
 
 
+def get_tts_settings(database_name: str):
+    database_name = database_name.lower().strip()
+
+    settings = {
+        "hindi": {
+            "voice": "nova",
+            "instructions": """
+                Speak as a native Hindi speaker from India.
+
+                This audio is for a language-learning application.
+
+                Use authentic Indian Hindi pronunciation, pitch patterns, rhythm, and intonation.
+
+                Do not use an American or foreign accent.
+
+                Speak clearly, calmly, patiently, like a teacher.
+
+                Use a slightly slower pace than everyday conversation so learners can clearly hear each word.
+
+                Pause naturally between words and phrases.
+
+                Maintain natural pronunciation and rhythm.
+
+                Do not sound rushed.
+
+                Speak slowly.
+
+                Do not translate, explain, or add words.
+
+                Only speak the provided text.
+                """
+                        },
+
+                        "japanese": {
+                            "voice": "nova",
+                            "instructions": """
+                Speak as a native Japanese speaker from Japan.
+
+                This audio is for a language-learning application.
+
+                Use authentic Japanese pronunciation, pitch patterns, rhythm, and intonation.
+
+                Do not use an American or foreign accent.
+
+                Speak clearly, calmly, patiently, like a teacher.
+
+                Use a slightly slower pace than everyday conversation so learners can clearly hear each word.
+
+                Pause naturally between words and phrases.
+
+                Maintain natural pronunciation and rhythm.
+
+                Do not sound rushed.
+
+                Speak slowly
+
+                Do not translate, explain, or add words.
+
+                Only speak the provided text.
+                """
+                        },
+
+                        "german": {
+                            "voice": "nova",
+                            "instructions": """
+                Speak as a native German speaker from Germany.
+
+                This audio is for a language-learning application.
+
+                Use authentic German pronunciation, pitch patterns, rhythm, and intonation.
+
+                Do not use an American or foreign accent.
+
+                Speak clearly, calmly, patiently, like a teacher.
+
+                Use a slightly slower pace than everyday conversation so learners can clearly hear each word.
+
+                Pause naturally between words and phrases.
+
+                Maintain natural pronunciation and rhythm.
+
+                Do not sound rushed.
+
+                Speak slowly
+
+                Do not translate, explain, or add words.
+
+                Only speak the provided text.
+                """
+                        },
+
+                        "french": {
+                            "voice": "nova",
+                            "instructions": """
+                Speak as a native French speaker from France.
+
+                This audio is for a language-learning application.
+
+                Use authentic French pronunciation, pitch patterns, rhythm, and intonation.
+
+                Do not use an American or foreign accent.
+
+                Speak clearly, calmly, patiently, like a teacher.
+
+                Use a slightly slower pace than everyday conversation so learners can clearly hear each word.
+
+                Pause naturally between words and phrases.
+
+                Maintain natural pronunciation and rhythm.
+
+                Do not sound rushed.
+
+                Speak slowly
+
+                Do not translate, explain, or add words.
+
+                Only speak the provided text.
+                """
+                        },
+
+                        "italian": {
+                            "voice": "nova",
+                            "instructions": """
+                Speak as a native Italian speaker from Italy.
+
+                This audio is for a language-learning application.
+
+                Use authentic Italian pronunciation, pitch patterns, rhythm, and intonation.
+
+                Do not use an American or foreign accent.
+
+                Speak clearly, calmly, patiently, like a teacher.
+
+                Use a slightly slower pace than everyday conversation so learners can clearly hear each word.
+
+                Pause naturally between words and phrases.
+
+                Maintain natural pronunciation and rhythm.
+
+                Do not sound rushed.
+
+                Speak slowly
+
+                Do not translate, explain, or add words.
+
+                Only speak the provided text.
+                """
+                        },
+
+                        "spanish": {
+                            "voice": "nova",
+                            "instructions": """
+                Speak as a native Spanish speaker from Spain.
+
+                This audio is for a language-learning application.
+
+                Use authentic Spanish pronunciation, pitch patterns, rhythm, and intonation.
+
+                Do not use an American or foreign accent.
+
+                Speak clearly, calmly, patiently, like a teacher.
+
+                Use a slightly slower pace than everyday conversation so learners can clearly hear each word.
+
+                Pause naturally between words and phrases.
+
+                Maintain natural pronunciation and rhythm.
+
+                Do not sound rushed.
+
+                Speak Slowly
+
+                Do not translate, explain, or add words.
+
+                Only speak the provided text.
+                """
+                        },
+
+                        "chinese": {
+                            "voice": "nova",
+                            "instructions": """
+                Speak as a native Chinese speaker from China.
+
+                This audio is for a language-learning application.
+
+                Use authentic Chinese pronunciation, pitch patterns, rhythm, and intonation.
+
+                Do not use an American or foreign accent.
+
+                Speak clearly, calmly, patiently, like a teacher.
+
+                Use a slightly slower pace than everyday conversation so learners can clearly hear each word.
+
+                Pause naturally between words and phrases.
+
+                Maintain natural pronunciation and rhythm.
+
+                Do not sound rushed.
+
+                Speak slowly
+
+                Do not translate, explain, or add words.
+
+                Only speak the provided text.
+                """
+        }
+    }
+
+    if database_name not in settings:
+        raise ValueError(f"Unsupported database: {database_name}")
+
+    return settings[database_name]
+
+
+# NOTE: GenerateVocabAudioRequest needs:  title: str | None = None
+# (source_language / target_language / voice / tts_instructions are no longer
+#  used by this route — audio is spoken from question_text with per-language
+#  settings from get_tts_settings — but they can stay on the model harmlessly.)
+
+
 @app.post("/generate-vocab-audio")
 def generate_vocab_audio(body: GenerateVocabAudioRequest):
     """
-    Finds all vocabulary questions that have no Audio row (matched on question_id),
-    For each vocabulary question:
-      1. Check the existing answer text.
-         - If blank/missing: translate question_text (English → target_language) via AWS Translate
-           and save the translation back to the Answer table.
-         - If populated: use as-is.
-      2. Generate TTS audio from the answer text.
-      3. Upload the MP3 to S3.
-      4. Insert an Audio row into the database.
-
-    Each question is processed independently — a failure on one does not block the rest.
+    Streams NDJSON progress while generating audio for vocabulary questions whose audio
+    is MISSING (no Audio row, or a row whose audio_url is NULL/blank).
+ 
+    Scope: body.titles (one or many lessons); omit titles to scan the whole DB.
+    Audio is spoken from the QUESTION TEXT, using per-language voice + instructions
+    from get_tts_settings. Each question is independent — one failure doesn't stop the rest.
+    For a question with a blank Audio row, the row is UPDATED in place; otherwise a row is INSERTed.
     """
-    effective_api_key = body.openai_api_key or os.getenv("OPENAI_API_KEY")
-    if not effective_api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key is required.")
-
-    openai_client = OpenAI(api_key=effective_api_key)
-    s3 = _make_s3_client(body.aws_region, body.aws_access_key_id, body.aws_secret_access_key)
-
-    # AWS Translate client (shares same credentials as S3)
-    translate_kwargs: dict = {"region_name": body.aws_region}
-    if body.aws_access_key_id and body.aws_secret_access_key:
-        translate_kwargs["aws_access_key_id"] = body.aws_access_key_id
-        translate_kwargs["aws_secret_access_key"] = body.aws_secret_access_key
-    translate_client = boto3.client("translate", **translate_kwargs)
-
-    try:
-        conn = connect_to_db(body.db)
-    except Exception as e:
-        print(traceback.format_exc())
-        raise HTTPException(status_code=400, detail=f"Could not connect to database: {e}")
-
-    # Fetch vocab questions that are missing audio
-    sql = _VOCAB_NO_AUDIO_SQL
-    if body.limit is not None:
-        sql += f" LIMIT {int(body.limit)}"
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
-    except Exception as e:
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"Failed to query vocab questions: {e}")
-
-    if not rows:
-        conn.close()
-        return JSONResponse(content={
-            "status": "ok",
-            "message": "No vocabulary questions without audio found.",
-            "summary": {"total_found": 0, "succeeded": 0, "failed": 0},
-            "results": [],
-        })
-
-    prefix = body.s3_prefix.rstrip("/")
-    results = []
-    succeeded = failed = 0
-
-    for row in rows:
-        question_id   = row["question_id"]
-        lesson_id     = row["lesson_id"]
-        sequence_id   = row["sequence_id"]
-        question_text = row["question_text"]
-        lesson_title  = row["lesson_title"]
-        answer_text   = row.get("answer_text") or ""
-
-        safe_title = _safe_slug(lesson_title)
-        s3_key    = f"{prefix}/{lesson_id}_{question_id}_{safe_title}.mp3"
-        audio_url = f"https://{body.s3_bucket}.s3.{body.aws_region}.amazonaws.com/{s3_key}"
-
-        log: dict = {
-            "question_id":   question_id,
-            "lesson_id":     lesson_id,
-            "lesson_title":  lesson_title,
-            "question_text": question_text,
-            "answer_text":   answer_text or None,
-            "translated":    False,
-            "audio_url":     None,
-            "status":        None,
-            "error":         None,
-        }
-
+ 
+    def stream():
+        effective_api_key = body.openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not effective_api_key:
+            yield _emit("error", message="OpenAI API key is required."); return
+ 
+        openai_client = OpenAI(api_key=effective_api_key)
+        s3 = _make_s3_client(body.aws_region, body.aws_access_key_id, body.aws_secret_access_key)
+ 
         try:
-            # 1. Resolve the text to speak — translate if answer is blank
-            if not answer_text.strip():
-                translated = _translate_text(
-                    translate_client, question_text,
-                    body.source_language, body.target_language,
-                )
-                # Persist the translation back to the Answer table
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT COUNT(*) AS cnt FROM Answer WHERE question_id = %s",
-                        (question_id,),
+            conn = connect_to_db(body.db)
+            database_name = body.db.database
+            tts_settings = get_tts_settings(database_name)
+            voice = tts_settings["voice"]
+            tts_instructions = tts_settings["instructions"]
+        except Exception as e:
+            yield _emit("error", message=f"Could not connect to database: {e}"); return
+ 
+        yield _emit("start", action="generate-vocab-audio",
+                    database=database_name,
+                    scope=(body.titles if body.titles else "whole_db"))
+ 
+        # Vocab questions whose audio is missing: no Audio row, OR a row with blank/NULL url.
+        sql = """
+            SELECT q.question_id, q.lesson_id, q.sequence_id, q.question_text,
+                   l.title AS lesson_title
+            FROM Question q
+            JOIN Lesson l ON q.lesson_id = l.lesson_id
+            LEFT JOIN Audio au ON au.question_id = q.question_id
+            WHERE l.type = 'vocabulary'
+              AND (au.question_id IS NULL OR au.audio_url IS NULL OR TRIM(au.audio_url) = '')
+        """
+        params: list = []
+        if body.titles:
+            placeholders = ",".join(["%s"] * len(body.titles))
+            sql += f" AND l.title IN ({placeholders})"
+            params.extend(body.titles)
+        sql += " ORDER BY q.lesson_id, q.sequence_id"
+        if body.limit is not None:
+            sql += " LIMIT %s"
+            params.append(int(body.limit))
+ 
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        except Exception as e:
+            conn.close()
+            yield _emit("error", message=f"Failed to query vocab questions: {e}"); return
+ 
+        yield _emit("found", total=len(rows))
+        if not rows:
+            conn.close()
+            yield _emit("summary", total_found=0, succeeded=0, failed=0)
+            return
+ 
+        prefix = body.s3_prefix.rstrip("/")
+        succeeded = failed = 0
+ 
+        try:
+            for idx, row in enumerate(rows, start=1):
+                question_id   = row["question_id"]
+                lesson_id     = row["lesson_id"]
+                sequence_id   = row["sequence_id"]
+                question_text = row["question_text"]
+                lesson_title  = row["lesson_title"]
+ 
+                safe_title = _safe_slug(lesson_title)
+                s3_key    = f"{prefix}/{lesson_id}_{question_id}_{safe_title}.mp3"
+                audio_url = f"https://{body.s3_bucket}.s3.{body.aws_region}.amazonaws.com/{s3_key}"
+ 
+                yield _emit("processing", n=idx, total=len(rows),
+                            lesson_title=lesson_title, question_id=question_id,
+                            sequence_id=sequence_id, question_text=question_text)
+ 
+                try:
+                    if not (question_text or "").strip():
+                        raise ValueError("question_text is blank - nothing to speak")
+ 
+                    # 1. TTS from the QUESTION text
+                    audio_bytes = _generate_tts_bytes(
+                        openai_client, question_text, body.tts_model, voice, tts_instructions,
                     )
-                    has_row = cur.fetchone()["cnt"] > 0
-
-                    if has_row:
+ 
+                    # 2. Upload (deterministic key -> overwrites any stale file)
+                    s3.put_object(Bucket=body.s3_bucket, Key=s3_key,
+                                  Body=audio_bytes, ContentType="audio/mpeg")
+ 
+                    # 3. UPDATE blank row in place, or INSERT if none
+                    with conn.cursor() as cur:
                         cur.execute(
-                            "UPDATE Answer SET answer_text = %s WHERE question_id = %s AND is_correct = 1",
-                            (translated, question_id),
+                            "SELECT audio_id FROM Audio WHERE question_id = %s ORDER BY audio_id ASC LIMIT 1",
+                            (question_id,),
                         )
+                        existing = cur.fetchone()
+ 
+                    action = "updated" if existing else "inserted"
+                    if existing:
+                        metadata = json.dumps({"source": "tts", "tts_model": body.tts_model, "voice": voice})
+                        with conn.cursor() as cur:
+                            try:
+                                cur.execute(
+                                    "UPDATE Audio SET audio_url = %s, audio_metadata = CAST(%s AS JSON) "
+                                    "WHERE audio_id = %s",
+                                    (audio_url, metadata, existing["audio_id"]),
+                                )
+                            except pymysql.err.OperationalError as e:
+                                if e.args[0] == 1054:
+                                    cur.execute("UPDATE Audio SET audio_url = %s WHERE audio_id = %s",
+                                                (audio_url, existing["audio_id"]))
+                                else:
+                                    raise
                     else:
-                        cur.execute(
-                            "INSERT INTO Answer (lesson_id, question_id, answer_text, is_correct) "
-                            "VALUES (%s, %s, %s, 1)",
-                            (lesson_id, question_id, translated),
+                        _insert_vocab_audio_row(
+                            conn, lesson_id, question_id, sequence_id, audio_url, body.tts_model, voice,
                         )
-
-                answer_text = translated
-                log["answer_text"] = translated
-                log["translated"] = True
-
-            # 2. Generate TTS audio from the answer text
-            audio_bytes = _generate_tts_bytes(
-                openai_client, answer_text,
-                body.tts_model, body.voice, body.tts_instructions,
-            )
-
-            # 3. Upload MP3 to S3
-            s3.put_object(
-                Bucket=body.s3_bucket,
-                Key=s3_key,
-                Body=audio_bytes,
-                ContentType="audio/mpeg",
-            )
-
-            # 4. Insert Audio row into DB
-            _insert_vocab_audio_row(
-                conn, lesson_id, question_id, sequence_id, audio_url,
-                body.tts_model, body.voice,
-            )
-            conn.commit()
-
-            log["audio_url"] = audio_url
-            log["status"] = "success"
-            succeeded += 1
-
+ 
+                    conn.commit()
+                    succeeded += 1
+                    yield _emit("success", question_id=question_id, sequence_id=sequence_id,
+                                lesson_title=lesson_title, audio_url=audio_url, row=action)
+ 
+                except Exception as e:
+                    conn.rollback()
+                    failed += 1
+                    yield _emit("failed", question_id=question_id, sequence_id=sequence_id,
+                                lesson_title=lesson_title, error=str(e))
+ 
+            yield _emit("summary", total_found=len(rows), succeeded=succeeded, failed=failed)
+            logger.info("generate-vocab-audio done | found=%d ok=%d fail=%d",
+                        len(rows), succeeded, failed)
+ 
         except Exception as e:
             conn.rollback()
-            log["status"] = "failed"
-            log["error"] = str(e)
-            failed += 1
-
-        results.append(log)
-
-    conn.close()
-
-    all_ok = failed == 0
-    return JSONResponse(
-        content={
-            "status": "ok" if all_ok else "partial",
-            "summary": {
-                "total_found": len(rows),
-                "succeeded": succeeded,
-                "failed": failed,
-            },
-            "results": results,
-        },
-        status_code=200 if all_ok else 207,
-    )
+            logger.error("generate-vocab-audio crashed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e))
+        finally:
+            conn.close()
+ 
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 @app.post("/generate-unit-images")
