@@ -3812,23 +3812,32 @@ def rebalance_grammar_categories(body: RebalanceGrammarRequest):
 #  logger / JSONResponse / HTTPException / json / re / Path already in main.py.
 # =============================================================================
 
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    _OPENPYXL_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    Workbook = Font = PatternFill = Alignment = None  # type: ignore[assignment]
+    _OPENPYXL_AVAILABLE = False
 
 # Fixed display order of type sections within a unit
 _TYPE_ORDER = ["vocabulary", "grammar", "reading", "writing", "listening", "speaking"]
 
-# Styling
-_UNIT_FILL   = PatternFill("solid", fgColor="1F4E78")  # dark blue
-_TYPE_FILL   = PatternFill("solid", fgColor="2E75B6")  # medium blue
-_LESSON_FILL = PatternFill("solid", fgColor="BDD7EE")  # light blue
-_HEADER_FILL = PatternFill("solid", fgColor="D9D9D9")  # grey column headers
-_WHITE_BOLD  = Font(name="Arial", bold=True, color="FFFFFF")
-_DARK_BOLD   = Font(name="Arial", bold=True, color="000000")
-_NORMAL      = Font(name="Arial")
-_WRAP_TOP    = Alignment(wrap_text=True, vertical="top")
-_WRAP_CENTER = Alignment(wrap_text=True, vertical="top", horizontal="center")
+# Styling (only available when openpyxl is installed)
+if _OPENPYXL_AVAILABLE:
+    _UNIT_FILL   = PatternFill("solid", fgColor="1F4E78")  # dark blue
+    _TYPE_FILL   = PatternFill("solid", fgColor="2E75B6")  # medium blue
+    _LESSON_FILL = PatternFill("solid", fgColor="BDD7EE")  # light blue
+    _HEADER_FILL = PatternFill("solid", fgColor="D9D9D9")  # grey column headers
+    _WHITE_BOLD  = Font(name="Arial", bold=True, color="FFFFFF")
+    _DARK_BOLD   = Font(name="Arial", bold=True, color="000000")
+    _NORMAL      = Font(name="Arial")
+    _WRAP_TOP    = Alignment(wrap_text=True, vertical="top")
+    _WRAP_CENTER = Alignment(wrap_text=True, vertical="top", horizontal="center")
+else:
+    _UNIT_FILL = _TYPE_FILL = _LESSON_FILL = _HEADER_FILL = None
+    _WHITE_BOLD = _DARK_BOLD = _NORMAL = None
+    _WRAP_TOP = _WRAP_CENTER = None
 
 
 class ExportQAWorkbookRequest(BaseModel):
