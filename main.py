@@ -4108,6 +4108,11 @@ def export_qa_workbook(body: ExportQAWorkbookRequest):
     """
     logger.info("export-qa-workbook started | db=%s label=%s units=%s",
                 body.db.database, body.language_label, body.units)
+    if not _OPENPYXL_AVAILABLE:
+        raise HTTPException(
+            status_code=500,
+            detail="openpyxl is required for /export-qa-workbook (pip install openpyxl).",
+        )
     try:
         conn = connect_to_db(body.db)
     except Exception as e:
