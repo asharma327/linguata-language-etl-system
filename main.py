@@ -1790,13 +1790,20 @@ def generate_vocab_audio(body: GenerateVocabAudioRequest):
  
         try:
             conn = connect_to_db(body.db)
-            database_name = body.db.database
-            tts_settings = get_tts_settings(database_name)
-            voice = tts_settings["voice"]
-            tts_instructions = tts_settings["instructions"]
         except Exception as e:
-            yield _emit("error", message=f"Could not connect to database: {e}"); return
- 
+            yield _emit("error", message=f"Could not connect to database: {e}")
+            return
+
+        database_name = body.db.database
+        try:
+            tts_settings = get_tts_settings(database_name)
+        except ValueError as e:
+            conn.close()
+            yield _emit("error", message=str(e))
+            return
+
+        voice = tts_settings["voice"]
+        tts_instructions = tts_settings["instructions"]
         yield _emit("start", action="generate-vocab-audio",
                     database=database_name,
                     scope=(body.titles if body.titles else "whole_db"))
