@@ -129,7 +129,9 @@ class GenerateVocabAudioRequest(BaseModel):
     tts_model: str = "gpt-4o-mini-tts"
     voice: str = "alloy"
     tts_instructions: str | None = (
-        "Speak slowly and clearly with a warm, friendly, teacher-like tone."
+        "Speak slowly and clearly with a warm, friendly, teacher-like tone. "
+        "When the text is English, use standard native English with no foreign accent "
+        "(clear, neutral pronunciation)."
     )
     source_language: str = "en"                       # AWS Translate source language code
     target_language: str = "hi"                       # AWS Translate target language code (e.g. "hi", "es")
@@ -240,13 +242,20 @@ def connect_to_db(config: DBConfig, use_database: bool = True):
 
 
 def resolve_cefr(filename: str, mapping: list[CefrRange] | None, fallback: str) -> str:
-    """Extract unit number from filename and return the matching CEFR level."""
+    """Extract unit or lesson index from filename and return the matching CEFR level."""
     if mapping:
         match = re.search(r"^unit(\d+)", filename, re.IGNORECASE)
         if match:
             unit = int(match.group(1))
             for r in mapping:
                 if r.min <= unit <= r.max:
+                    return r.cefr_level
+        # Italian FAST-style: "... Volume 1 - Lesson 01 ..." — map by lesson number
+        m_lesson = re.search(r"Lesson\s+(\d+)", filename, re.IGNORECASE)
+        if m_lesson:
+            lesson_n = int(m_lesson.group(1))
+            for r in mapping:
+                if r.min <= lesson_n <= r.max:
                     return r.cefr_level
     return fallback
 
@@ -407,9 +416,13 @@ def insert_lessons(body: InsertLessonsRequest):
             files_failed.append(file_log)
             continue
 
+        # Support both a single lesson object {...} and a list of lessons [...]
+        lesson_entries = raw_data if isinstance(raw_data, list) else [raw_data]
+
         # --- Insert into DB (one transaction per file) ---
         try:
             with conn.cursor() as cur:
+              for data in lesson_entries:
 
                 # 1. Lesson
                 has_question = 1 if data.get("questions_and_answers") else 0
@@ -458,7 +471,7 @@ def insert_lessons(body: InsertLessonsRequest):
                     question_id = cur.lastrowid
                     file_log["questions_inserted"] += 1
 
-                    # Answers — handle all 3 formats:
+                    # Answers — handle all formats:
                     # A) answers[].answer_text  (vocabulary short_answer)
                     # B) flat answer + is_correct on the question  (grammar short_answer)
                     # C) answers[].answer  (multiple_choice)
@@ -625,9 +638,19 @@ def _extract_unit_number_from_filename(filename: str) -> int | None:
     """Return the unit number found in the filename, or None.
 
     Handles formats like:
-        Spanish Basic Course - Volume 2 - Unit 28C.mp3  →  28
-        unit05_listening_a.mp3                          →  5
+        Spanish Basic Course - Volume 2 - Unit 28C.mp3              →  28
+        FSI - German ... - Unit 01 1.1.mp3                        →  1
+        FSI - Italian FAST - Volume 1 - Lesson 07.mp3             →  7  (lesson index)
+        unit05_listening_a.mp3                                     →  5
     """
+    # Italian FAST: lesson number must win over "Volume 1" (otherwise every file would be 1)
+    m_lesson = re.search(r"Lesson\s+(\d+)", filename, re.IGNORECASE)
+    if m_lesson:
+        try:
+            return int(m_lesson.group(1))
+        except ValueError:
+            pass
+
     m = re.search(r"Unit\s+(\d+)", filename, re.IGNORECASE)
     if m:
         try:
@@ -648,15 +671,40 @@ def _build_listening_lesson_title(filename: str) -> str:
 
     Examples
     --------
-    Spanish Basic Course - Volume 2 - Unit 28C.mp3  →  unit28_listening_c
-    Spanish Basic Course - Volume 1 - Unit 02A.mp3  →  unit2_listening_a
+    FSI - Italian FAST - Volume 1 - Lesson 01.mp3     →  Volume 1 - Lesson 01
+    FSI ... Unit 01 1.1.mp3                           →  unit1_listening_1
+    FSI ... Unit 02 2.3.mp3                           →  unit2_listening_3
+    Spanish Basic Course - Volume 2 - Unit 28C.mp3    →  unit28_listening_c
+    Spanish Basic Course - Volume 1 - Unit 02A.mp3   →  unit2_listening_a
     some_other_file.mp3                              →  some_other_file  (fallback)
     """
     stem = Path(filename).stem
+
+    # Italian FAST (S3): "Volume 1 - Lesson 01" — store human-readable segment in DB
+    m_it = re.search(r"Volume\s+(\d+)\s+-\s+Lesson\s+(\d+)", stem, re.IGNORECASE)
+    if m_it:
+        vol = int(m_it.group(1))
+        lesson_n = int(m_it.group(2))
+        return f"Volume {vol} - Lesson {lesson_n:02d}"
+
+    # German-style (FSI): "Unit 01 1.1" → unit1_listening_1 (suffix = segment after the dot)
+    m_de = re.search(r"Unit\s+(\d+)\s+(\d+)\.(\d+)", stem, re.IGNORECASE)
+    if m_de:
+        unit_num = int(m_de.group(1))
+        minor = int(m_de.group(3))
+        return f"unit{unit_num}_listening_{minor}"
+
+    # Spanish-style: letter immediately after unit digits, e.g. Unit 02A
+    m_es = re.search(r"Unit\s+(\d+)([A-Za-z])\b", stem, re.IGNORECASE)
+    if m_es:
+        unit_num = int(m_es.group(1))
+        return f"unit{unit_num}_listening_{m_es.group(2).lower()}"
+
+    # Legacy: Unit NN optional single letter (may have nothing after Unit NN)
     m = re.search(r"Unit\s+(\d+)([A-Za-z]?)", stem, re.IGNORECASE)
     if m:
-        unit_num = int(m.group(1))          # strips leading zeros (02 → 2)
-        part = m.group(2).lower()           # 'a', 'b', 'c', or ''
+        unit_num = int(m.group(1))
+        part = m.group(2).lower()
         part_suffix = f"_{part}" if part else ""
         return f"unit{unit_num}_listening{part_suffix}"
     return stem
@@ -943,9 +991,11 @@ class GrammarScriptToAudio:
 
     SCRIPT_MODEL = "gpt-5-mini"
     TTS_MODEL = "gpt-4o-mini-tts"
-    TTS_VOICE = "alloy"
+    TTS_VOICE = "marin"
     TTS_INSTRUCTIONS = (
-        "Speak slowly and clearly with lots of pauses; warm, friendly, teacher-like tone."
+        "Use a warm, friendly, teacher-like adult female voice. "
+        "Speak slowly and clearly with gentle pauses. "
+        "Sound encouraging, calm, and natural."
     )
 
     def __init__(self, api_key: str | None = None):
@@ -957,7 +1007,7 @@ class GrammarScriptToAudio:
             "You are a helpful educator. Rewrite the following into a clear, friendly, "
             "instructional script that is between 100 and 120 words. Keep it positive, "
             "encouraging, and easy to follow. Do not include any extra commentary, only the script. "
-            "Make sure it is smooth and natural, as it will be translated to speech. "
+            "Make sure it is smooth and natural, as it will be translated to speech."
             "Make sure the script is direct and to the point without any introduction or preamble. "
             "This will be used on a Duolingo-style app but for working professionals, "
             "so the script should be to the point and get the information across quickly and directly.\n\n"
@@ -1080,7 +1130,6 @@ def generate_lesson_images(body: GenerateImagesRequest):
                     LEFT JOIN Image i ON i.lesson_id = l.lesson_id AND i.question_id = q.question_id
                     WHERE ({like_clauses})
                       AND l.type = 'vocabulary'
-                      AND LENGTH(q.question_text) > 4
                       AND i.image_id IS NULL
                     LIMIT %s
                 """, (*like_params, body.limit_questions))
@@ -1273,16 +1322,16 @@ def generate_grammar_audio(body: GenerateGrammarAudioRequest):
 
             # Path 1: units → all grammar articles
             if body.units:
-                like_clauses = " OR ".join(["l.title LIKE %s" for _ in body.units])
-                like_params = [f"unit{u}_grammar%" for u in body.units]
+                regexp_clauses = " OR ".join(["l.title REGEXP %s" for _ in body.units])
+                regexp_params = [f"^unit{u}_" for u in body.units]
                 cur.execute(f"""
                     SELECT a.article_id, a.lesson_id, a.sequence_id, a.content, l.title
                     FROM Article a
                     JOIN Lesson l ON l.lesson_id = a.lesson_id
-                    WHERE ({like_clauses})
+                    WHERE ({regexp_clauses})
                       AND l.type = 'grammar'
                     LIMIT %s
-                """, (*like_params, body.limit_articles))
+                """, (*regexp_params, body.limit_articles))
                 for row in cur.fetchall():
                     work_items.append({
                         "lesson_id": row["lesson_id"],
@@ -2977,7 +3026,7 @@ def replace_speaking_articles(body: ReplaceSpeakingArticlesRequest):
 
             # Parse JSON
             try:
-                data = json.loads(json_file.read_text(encoding="utf-8"))
+                data = json.loads(json_file.read_text(encoding="utf-8-sig"))
                 logger.info("[%s] JSON parsed successfully", json_file.name)
             except Exception as e:
                 logger.warning("[%s] JSON parse error: %s", json_file.name, e)
@@ -3307,7 +3356,7 @@ def backfill_answer_text(body: BackfillAnswerTextRequest):
 
             # Parse JSON
             try:
-                data = json.loads(json_file.read_text(encoding="utf-8"))
+                data = json.loads(json_file.read_text(encoding="utf-8-sig"))
             except Exception as e:
                 file_log["status"] = "failed"
                 file_log["errors"].append(f"JSON parse error: {e}")
