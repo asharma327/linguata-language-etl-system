@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
     # Exact lesson titles (one or many). For a single lesson, use a one-item list.
     TITLES = [
-        "unit1_basic_sentences",
+        "unit2_basic_sentences",
         # "unit5_basic_sentences",
     ]
 
@@ -68,7 +68,7 @@ if __name__ == "__main__":
     if ADDITIONAL_PROMPT:
         payload["additional_prompt"] = ADDITIONAL_PROMPT
 
-    with requests.post("http://localhost:8000/generate-lesson-images",
+    with requests.post("http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com/generate-lesson-images",
                        json=payload, stream=True) as resp:
         for raw in resp.iter_lines(decode_unicode=True):
             if not raw:
