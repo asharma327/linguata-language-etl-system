@@ -5,28 +5,30 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+language = "spanish"
+
 if __name__ == "__main__":
 
     DB = {
         "host": os.environ["DB_HOST"],
         "user": os.environ["DB_USER"],
         "password": os.environ["DB_PASSWORD"],
-        "database": "spanish"          # <-- change only this
+        "database": language          
     }
 
     # Lessons to process. One or many — for a single lesson use a one-item list.
     # Set TITLES = None to scan the whole database.
     TITLES = [
-        "unit21_basic_sentences",
-        "unit22_basic_sentences",
-        "unit23_basic_sentences",
-        "unit24_basic_sentences",
-        "unit25_basic_sentences",
-        "unit26_basic_sentences",
-        "unit27_basic_sentences",
-        "unit28_basic_sentences",
-        "unit29_basic_sentences",
-        "unit30_basic_sentences",
+        "unit1_basic_sentences",
+        # "unit22_basic_sentences",
+        # "unit23_basic_sentences",
+        # "unit24_basic_sentences",
+        # "unit25_basic_sentences",
+        # "unit26_basic_sentences",
+        # "unit27_basic_sentences",
+        # "unit28_basic_sentences",
+        # "unit29_basic_sentences",
+        # "unit30_basic_sentences",
     ]
 
     LIMIT = None  # limit number of questions to process (for testing); set to None for no limit
@@ -40,7 +42,7 @@ if __name__ == "__main__":
     AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
 
     S3_BUCKET = "content-media-generation"
-    S3_PREFIX = "spanish/vocab_audio"
+    S3_PREFIX = f"{language}/vocab_audio"
     AWS_REGION = "us-east-1"
 
     payload = {

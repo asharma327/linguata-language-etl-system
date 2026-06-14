@@ -67,8 +67,10 @@ class GenerateImagesRequest(BaseModel):
     db: DBConfig
     units: list[int] | None = None                  # path 1: select vocab lessons by unit number
     lessons: list[LessonImageTarget] | None = None  # path 2: explicit lesson/question targets
+    titles: list[str] | None = None
+    translate: bool = True
     additional_prompt: str | None = None            # global; per-lesson value overrides this
-    limit_questions: int = 200                      # max questions to process (units path)
+    limit_questions: int | None = None                     # max questions to process (units path)
     translate: bool = False                         # True if question_text is NOT already in English
     s3_bucket: str
     s3_prefix: str = "spanish"
@@ -273,10 +275,19 @@ def make_create_if_not_exists(ddl: str) -> str:
 
 # --- Routes ---
 
+@app.get("/")
+def root():
+    return {"status": "healthy"}
+
 @app.get("/test")
 def test():
     return {"status": "ok"}
 
+@app.get("/kavya-debug")
+def kavya_debug():
+    return {
+        "message": "THIS IS THE NEW DEPLOYMENT"
+    }
 
 @app.post("/clone-schema")
 def clone_schema(body: CloneSchemaRequest):
@@ -1028,7 +1039,7 @@ class GrammarScriptToAudio:
         return response.content
 
 
-# --- VocabToPictures class ---
+# --- VocabToPictures class (unchanged) ---
 
 class VocabToPictures:
     """Generate images for vocabulary words using OpenAI, return bytes (no local save)."""
@@ -1040,12 +1051,6 @@ class VocabToPictures:
 
     def generate_one(self, word: str, translate: bool = False,
                      additional_prompt: str | None = None) -> dict | None:
-        """
-        Generate a single image for `word`.
-        If translate=True, first translates the word to English via GPT-4o-mini.
-        additional_prompt is appended to the image generation prompt if provided.
-        Returns dict with image_bytes and metadata, or None on failure.
-        """
         try:
             if translate:
                 resp = self.client.chat.completions.create(
@@ -1063,11 +1068,66 @@ class VocabToPictures:
             else:
                 english = word
 
-            gen_prompt = (
-                "Render the following word or phrase in a realistic style for a language learning app. "
-                "Keep it simple and contain **no text**. The word or phrase:\n"
-                f"'{english}'"
-            )
+            gen_prompt = f"""
+                    Create a vocabulary-learning image for a language-learning application.
+
+                    Original vocabulary:
+                    "{word}"
+
+                    English meaning:
+                    "{english}"
+
+                    Primary objective:
+                    Help a beginner language learner immediately understand and remember the vocabulary item.
+
+                    Decision rule:
+
+                    1. If the vocabulary can be clearly represented visually:
+
+                       * Create a realistic image of the concept.
+                       * Use a realistic photographic style.
+                       * Show one clear primary subject.
+                       * Make the meaning obvious without requiring text.
+                       * Prefer visual learning over written text.
+                       * Avoid unnecessary objects and background clutter.
+
+                    2. If the vocabulary is abstract, grammatical, functional, or difficult to represent visually:
+
+                       * Create a clean educational flashcard, classroom whiteboard, notebook page, teaching poster, or vocabulary card.
+                       * Show BOTH the original vocabulary and the English meaning.
+                       * Display them in the format:
+
+                         [original vocabulary] → [English meaning]
+
+                       Examples:
+
+                       está → is
+                       estar → to be
+                       porque → because
+                       cependant → however
+                       しかし → however
+
+                       * Make the text large, readable, and centered.
+                       * The vocabulary card should be the primary focus of the image.
+                       * Use a clean classroom or language-learning environment.
+                       * Make the image look like a professional educational resource.
+
+                    General requirements:
+
+                    * Use realistic photographic style.
+                    * Use natural colors and lighting.
+                    * Keep the composition simple and easy to understand.
+                    * Avoid visual clutter.
+                    * Avoid artistic abstraction.
+                    * Avoid visual metaphors.
+                    * Avoid logos.
+                    * Avoid watermarks.
+                    * Avoid unrelated objects.
+                    * Ensure the image remains clear and recognizable when resized to 256x256.
+                    * Optimize for vocabulary acquisition and learner comprehension rather than artistic appearance.
+
+                    Generate the single most educationally effective image possible.
+                    """
             if additional_prompt:
                 gen_prompt += f"\n\n{additional_prompt}"
 
@@ -1090,207 +1150,266 @@ class VocabToPictures:
         return None
 
 
-# --- Route ---
+def get_image_settings(database_name: str):
+    database_name = database_name.lower().strip()
+
+    settings = {
+        "hindi":    {"additional_prompt": "\nWhen appropriate, use objects, environments, clothing, and daily-life settings commonly seen in India.\nAvoid stereotypes.\n"},
+        "japanese": {"additional_prompt": "\nWhen appropriate, use objects, environments, and daily-life settings commonly seen in Japan.\nAvoid stereotypes.\n"},
+        "german":   {"additional_prompt": "\nWhen appropriate, use objects and environments commonly seen in Germany.\nAvoid stereotypes.\n"},
+        "french":   {"additional_prompt": "\nWhen appropriate, use objects and environments commonly seen in France.\nAvoid stereotypes.\n"},
+        "italian":  {"additional_prompt": "\nWhen appropriate, use objects and environments commonly seen in Italy.\nAvoid stereotypes.\n"},
+        "spanish":  {"additional_prompt": "\nUse culturally neutral imagery unless regional context is important.\n"},
+        "chinese":  {"additional_prompt": "\nWhen appropriate, use objects, environments, and daily-life settings commonly seen in China.\nAvoid stereotypes.\n"},
+    }
+    if database_name not in settings:
+        raise ValueError(f"Unsupported database: {database_name}")
+    return settings[database_name]
+
+
+# NOTE: GenerateImagesRequest needs:
+#     titles: list[str] | None = None        # one or many lessons (exact title match)
+#     translate: bool = True                 # default ON: question_text -> English before image
+# (units and lessons stay as they are. limit_questions is now a GLOBAL cap.)
+# Requires (already in main.py from the streaming routes): _emit, StreamingResponse.
+
+# The blank-aware image condition, reused by every path.
+_IMG_MISSING = "(i.image_id IS NULL OR i.image_url IS NULL OR TRIM(i.image_url) = '')"
+
 
 @app.post("/generate-lesson-images")
 def generate_lesson_images(body: GenerateImagesRequest):
     """
-    Generates images for vocabulary lesson questions and stores them in S3 + Image table.
+    Streams NDJSON progress while generating vocab images and storing them in S3 + Image table.
 
-    Two input modes (can combine both):
-      - units: auto-selects all vocab lessons for those unit numbers (skips questions that
-               already have images)
-      - lessons: explicit list of {lesson_id, question_ids?, additional_prompt?}
-                 If lesson is vocabulary and no question_ids given → all questions
-                 If question_ids given → only those questions
+    Three input modes (combinable):
+      - titles:  exact lesson titles (one or many)
+      - units:   all vocab lessons whose title starts with unit{N}
+      - lessons: explicit [{lesson_id, question_ids?, additional_prompt?}]
+
+    Only questions whose image is MISSING are processed (no Image row, or a row whose
+    image_url is NULL/blank). A blank row is UPDATED in place; otherwise a row is INSERTed.
+
+    limit_questions is a GLOBAL cap applied after the full work list is built and ordered
+    (lesson_id, sequence_id) — so limit_questions=1 generates only the first question,
+    regardless of which input mode you used.
     """
-    if not body.units and not body.lessons:
-        raise HTTPException(status_code=400, detail="Provide at least one of 'units' or 'lessons'")
 
-    try:
-        conn = connect_to_db(body.db)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not connect to database: {e}")
-
-    # --- Build work list ---
-    # Each item: {lesson_id, question_id, question_text, lesson_title, additional_prompt}
-    work_items: list[dict] = []
-
-    try:
-        with conn.cursor() as cur:
-
-            # Path 1: units → all vocab lessons, questions without an existing image
-            if body.units:
-                like_clauses = " OR ".join(["l.title LIKE %s" for _ in body.units])
-                like_params = [f"unit{u}%" for u in body.units]
-                cur.execute(f"""
-                    SELECT l.lesson_id, l.title, q.question_id, q.question_text
-                    FROM Lesson l
-                    JOIN Question q ON q.lesson_id = l.lesson_id
-                    LEFT JOIN Image i ON i.lesson_id = l.lesson_id AND i.question_id = q.question_id
-                    WHERE ({like_clauses})
-                      AND l.type = 'vocabulary'
-                      AND i.image_id IS NULL
-                    LIMIT %s
-                """, (*like_params, body.limit_questions))
-                for row in cur.fetchall():
-                    work_items.append({
-                        "lesson_id": row["lesson_id"],
-                        "question_id": row["question_id"],
-                        "question_text": row["question_text"],
-                        "lesson_title": row["title"],
-                        "additional_prompt": body.additional_prompt,
-                    })
-
-            # Path 2: explicit lesson targets
-            if body.lessons:
-                for target in body.lessons:
-                    cur.execute("SELECT lesson_id, title, type FROM Lesson WHERE lesson_id = %s",
-                                (target.lesson_id,))
-                    lesson_row = cur.fetchone()
-                    if not lesson_row:
-                        work_items.append({
-                            "lesson_id": target.lesson_id,
-                            "error": f"Lesson {target.lesson_id} not found",
-                        })
-                        continue
-
-                    effective_prompt = target.additional_prompt or body.additional_prompt
-                    is_vocab = lesson_row["type"] == "vocabulary"
-
-                    if target.question_ids:
-                        # Explicit question IDs
-                        fmt = ",".join(["%s"] * len(target.question_ids))
-                        cur.execute(
-                            f"SELECT question_id, question_text FROM Question "
-                            f"WHERE lesson_id = %s AND question_id IN ({fmt})",
-                            (target.lesson_id, *target.question_ids),
-                        )
-                    elif is_vocab:
-                        # Vocab lesson, no IDs specified → all questions
-                        cur.execute(
-                            "SELECT question_id, question_text FROM Question WHERE lesson_id = %s",
-                            (target.lesson_id,),
-                        )
-                    else:
-                        work_items.append({
-                            "lesson_id": target.lesson_id,
-                            "error": f"Lesson {target.lesson_id} is type '{lesson_row['type']}' — "
-                                     "specify question_ids explicitly for non-vocabulary lessons",
-                        })
-                        continue
-
-                    for qrow in cur.fetchall():
-                        work_items.append({
-                            "lesson_id": target.lesson_id,
-                            "question_id": qrow["question_id"],
-                            "question_text": qrow["question_text"],
-                            "lesson_title": lesson_row["title"],
-                            "additional_prompt": effective_prompt,
-                        })
-
-    except Exception as e:
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"Failed to build work list: {e}")
-
-    # --- Generate images ---
-    generator = VocabToPictures(
-        api_key=body.openai_api_key,
-        model="gpt-image-1",
-        size="1024x1024",
-    )
-
-    results = []
-    total_succeeded = total_failed = 0
-
-    for item in work_items:
-        # Items without question_id are pre-flagged errors (e.g. lesson not found)
-        if "error" in item:
-            results.append({
-                "lesson_id": item["lesson_id"],
-                "status": "failed",
-                "error": item["error"],
-            })
-            total_failed += 1
-            continue
-
-        log = {
-            "lesson_id": item["lesson_id"],
-            "question_id": item["question_id"],
-            "lesson_title": item["lesson_title"],
-            "question_text": item["question_text"],
-            "status": None,
-            "image_url": None,
-            "error": None,
-        }
+    def stream():
+        if not body.titles and not body.units and not body.lessons:
+            yield _emit("error", message="Provide at least one of 'titles', 'units', or 'lessons'")
+            return
 
         try:
-            gen = generator.generate_one(
-                word=item["question_text"],
-                translate=body.translate,
-                additional_prompt=item["additional_prompt"],
-            )
-            if not gen or not gen.get("image_bytes"):
-                raise RuntimeError("No image returned from generator")
+            conn = connect_to_db(body.db)
+            database_name = body.db.database
+            language_image_prompt = get_image_settings(database_name)["additional_prompt"]
+        except Exception as e:
+            yield _emit("error", message=f"Could not connect to database: {e}")
+            return
+        
+        yield _emit("start", action="generate-lesson-images", database=database_name,
+                    translate=body.translate,
+                    titles=body.titles or None, units=body.units or None,
+                    lessons=[t.lesson_id for t in body.lessons] if body.lessons else None)
+        
+        work_items: list[dict] = []
+        seen: set = set()  # (lesson_id, question_id) dedup across modes
 
-            png256 = _resize_to_256_png_bytes(gen["image_bytes"])
+        def _add(row, title, add_prompt):
+            key = (row["lesson_id"], row["question_id"])
+            if key in seen:
+                return
+            seen.add(key)
+            work_items.append({
+                "lesson_id": row["lesson_id"],
+                "question_id": row["question_id"],
+                "sequence_id": row.get("sequence_id", 0),
+                "question_text": row["question_text"],
+                "lesson_title": title,
+                "additional_prompt": add_prompt,
+            })
 
-            key = (f"{body.s3_prefix}/"
-                   f"{item['lesson_id']}_{item['question_id']}_"
-                   f"{_safe_slug(item['lesson_title'])}.png")
+        try:
+            with conn.cursor() as cur:
 
-            public_url = _upload_to_s3_public(
-                png256, key, body.s3_bucket, body.aws_region,
-                body.aws_access_key_id, body.aws_secret_access_key,
-            )
+                # Path 1: titles (exact match)
+                if body.titles:
+                    ph = ",".join(["%s"] * len(body.titles))
+                    cur.execute(f"""
+                        SELECT l.lesson_id, l.title, q.question_id, q.sequence_id, q.question_text
+                        FROM Lesson l
+                        JOIN Question q ON q.lesson_id = l.lesson_id
+                        LEFT JOIN Image i ON i.lesson_id = l.lesson_id AND i.question_id = q.question_id
+                        WHERE l.type = 'vocabulary' AND l.title IN ({ph}) AND {_IMG_MISSING}
+                    """, tuple(body.titles))
+                    for r in cur.fetchall():
+                        _add(r, r["title"], body.additional_prompt)
 
-            meta = {
-                "original_text": gen["original_text"],
-                "translated_text": gen["translated_text"],
-                "model": gen["model"],
-                "requested_size": gen["requested_size"],
-                "final_size": "256x256",
-                "s3_bucket": body.s3_bucket,
-                "s3_key": key,
-                "public_url": public_url,
-                "lesson_title": item["lesson_title"],
-            }
-            _insert_image_row(
-                conn,
-                lesson_id=item["lesson_id"],
-                question_id=item["question_id"],
-                image_url=public_url,
-                image_metadata_json=json.dumps(meta, ensure_ascii=False),
-            )
-            conn.commit()
+                # Path 2: units (prefix match)
+                if body.units:
+                    like_clauses = " OR ".join(["l.title LIKE %s" for _ in body.units])
+                    like_params = [f"unit{u}%" for u in body.units]
+                    cur.execute(f"""
+                        SELECT l.lesson_id, l.title, q.question_id, q.sequence_id, q.question_text
+                        FROM Lesson l
+                        JOIN Question q ON q.lesson_id = l.lesson_id
+                        LEFT JOIN Image i ON i.lesson_id = l.lesson_id AND i.question_id = q.question_id
+                        WHERE ({like_clauses}) AND l.type = 'vocabulary' AND {_IMG_MISSING}
+                    """, tuple(like_params))
+                    for r in cur.fetchall():
+                        _add(r, r["title"], body.additional_prompt)
 
-            log["status"] = "success"
-            log["image_url"] = public_url
-            total_succeeded += 1
+                # Path 3: explicit lessons
+                if body.lessons:
+                    for target in body.lessons:
+                        cur.execute("SELECT lesson_id, title, type FROM Lesson WHERE lesson_id = %s",
+                                    (target.lesson_id,))
+                        lesson_row = cur.fetchone()
+                        if not lesson_row:
+                            yield _emit("lesson_error", lesson_id=target.lesson_id, error="lesson not found")
+                            continue
+
+                        effective_prompt = target.additional_prompt or body.additional_prompt
+                        is_vocab = lesson_row["type"] == "vocabulary"
+
+                        if target.question_ids:
+                            fmt = ",".join(["%s"] * len(target.question_ids))
+                            cur.execute(f"""
+                                SELECT q.lesson_id, q.question_id, q.sequence_id, q.question_text
+                                FROM Question q
+                                LEFT JOIN Image i ON i.lesson_id = q.lesson_id AND i.question_id = q.question_id
+                                WHERE q.lesson_id = %s AND q.question_id IN ({fmt}) AND {_IMG_MISSING}
+                            """, (target.lesson_id, *target.question_ids))
+                        elif is_vocab:
+                            cur.execute(f"""
+                                SELECT q.lesson_id, q.question_id, q.sequence_id, q.question_text
+                                FROM Question q
+                                LEFT JOIN Image i ON i.lesson_id = q.lesson_id AND i.question_id = q.question_id
+                                WHERE q.lesson_id = %s AND {_IMG_MISSING}
+                            """, (target.lesson_id,))
+                        else:
+                            yield _emit("lesson_error", lesson_id=target.lesson_id,
+                                        error=f"lesson type '{lesson_row['type']}' — specify question_ids for non-vocab")
+                            continue
+
+                        for r in cur.fetchall():
+                            _add(r, lesson_row["title"], effective_prompt)
+
+        except Exception as e:
+            conn.close()
+            yield _emit("error", message=f"Failed to build work list: {e}")
+            return
+
+        # order globally, then apply the global cap
+        work_items.sort(key=lambda w: (w["lesson_id"], w["sequence_id"]))
+        if body.limit_questions is not None:
+            work_items = work_items[: int(body.limit_questions)]
+
+        yield _emit("found", total=len(work_items))
+        if not work_items:
+            conn.close()
+            yield _emit("summary", total_items=0, succeeded=0, failed=0)
+            return
+
+        generator = VocabToPictures(api_key=body.openai_api_key, model="gpt-image-1", size="1024x1024")
+        succeeded = failed = 0
+
+        try:
+            for idx, item in enumerate(work_items, start=1):
+                yield _emit("processing", n=idx, total=len(work_items),
+                            lesson_title=item["lesson_title"], question_id=item["question_id"],
+                            sequence_id=item["sequence_id"], question_text=item["question_text"])
+                try:
+                    effective_prompt = (item["additional_prompt"] or "") + "\n\n" + language_image_prompt
+
+                    gen = generator.generate_one(
+                        word=item["question_text"],
+                        translate=body.translate,
+                        additional_prompt=effective_prompt,
+                    )
+                    if not gen or not gen.get("image_bytes"):
+                        raise RuntimeError("No image returned from generator")
+
+                    png256 = _resize_to_256_png_bytes(gen["image_bytes"])
+                    key = (f"{body.s3_prefix}/"
+                           f"{item['lesson_id']}_{item['question_id']}_"
+                           f"{_safe_slug(item['lesson_title'])}.png")
+                    public_url = _upload_to_s3_public(
+                        png256, key, body.s3_bucket, body.aws_region,
+                        body.aws_access_key_id, body.aws_secret_access_key,
+                    )
+                    meta = {
+                        "original_text": gen["original_text"],
+                        "translated_text": gen["translated_text"],
+                        "model": gen["model"],
+                        "requested_size": gen["requested_size"],
+                        "final_size": "256x256",
+                        "s3_bucket": body.s3_bucket,
+                        "s3_key": key,
+                        "public_url": public_url,
+                        "lesson_title": item["lesson_title"],
+                    }
+                    meta_json = json.dumps(meta, ensure_ascii=False)
+
+                    # UPDATE blank row in place, else INSERT
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT image_id FROM Image WHERE lesson_id=%s AND question_id=%s "
+                            "ORDER BY image_id ASC LIMIT 1",
+                            (item["lesson_id"], item["question_id"]),
+                        )
+                        existing = cur.fetchone()
+
+                    action = "updated" if existing else "inserted"
+                    if existing:
+                        with conn.cursor() as cur:
+                            try:
+                                cur.execute(
+                                    "UPDATE Image SET image_url=%s, image_metadata=CAST(%s AS JSON) "
+                                    "WHERE image_id=%s",
+                                    (public_url, meta_json, existing["image_id"]),
+                                )
+                            except pymysql.err.OperationalError as e:
+                                if e.args[0] == 1054:  # older schema without image_metadata
+                                    cur.execute("UPDATE Image SET image_url=%s WHERE image_id=%s",
+                                                (public_url, existing["image_id"]))
+                                else:
+                                    raise
+                    else:
+                        _insert_image_row(
+                            conn,
+                            lesson_id=item["lesson_id"],
+                            question_id=item["question_id"],
+                            image_url=public_url,
+                            image_metadata_json=meta_json,
+                        )
+                    conn.commit()
+
+                    succeeded += 1
+                    yield _emit("success", question_id=item["question_id"],
+                                sequence_id=item["sequence_id"], lesson_title=item["lesson_title"],
+                                image_url=public_url, row=action)
+
+                except Exception as e:
+                    conn.rollback()
+                    failed += 1
+                    yield _emit("failed", question_id=item["question_id"],
+                                sequence_id=item["sequence_id"], lesson_title=item["lesson_title"],
+                                error=str(e))
+
+            yield _emit("summary", total_items=len(work_items), succeeded=succeeded, failed=failed)
+            logger.info("generate-lesson-images done | items=%d ok=%d fail=%d",
+                        len(work_items), succeeded, failed)
 
         except Exception as e:
             conn.rollback()
-            log["status"] = "failed"
-            log["error"] = str(e)
-            total_failed += 1
+            logger.error("generate-lesson-images crashed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e))
+        finally:
+            conn.close()
 
-        results.append(log)
-
-    conn.close()
-
-    all_ok = total_failed == 0
-    return JSONResponse(
-        content={
-            "status": "ok" if all_ok else "partial",
-            "summary": {
-                "total_items": len(work_items),
-                "succeeded": total_succeeded,
-                "failed": total_failed,
-            },
-            "results": results,
-        },
-        status_code=200 if all_ok else 207,
-    )
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 @app.post("/generate-grammar-audio")
