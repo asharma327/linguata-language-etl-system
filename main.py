@@ -1088,12 +1088,11 @@ class VocabToPictures:
 
                     2. If the vocabulary is very difficult to represent visually like one word vocabulary (e.g. "is", "because", "however", "to be"):
 
-                       * Create a clean educational flashcard, classroom whiteboard, notebook page, teaching poster, or vocabulary card.
+                       * Create a clean educational flashcard, classroom whiteboard, notebook page, teaching poster, or vocabulary card to display the word and its meaning.
                        * Show BOTH the original vocabulary and the English meaning.
-                       * Display them in the format:
+                       * Display them on in the format:
 
                          [original vocabulary] → [English meaning]
-                         display this horizontally, with a clear arrow or other visual separator. if showing vertically, then use a down arrow or other clear visual separator.
 
                        Examples:
 
