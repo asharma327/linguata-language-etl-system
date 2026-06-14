@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
     # Exact lesson titles (one or many). For a single lesson, use a one-item list.
     TITLES = [
-        "unit2_basic_sentences",
+        "unit3_basic_sentences",
         # "unit5_basic_sentences",
     ]
 
@@ -35,7 +35,7 @@ if __name__ == "__main__":
     ]
 
     ADDITIONAL_PROMPT = None    # global prompt applied to all
-    LIMIT_QUESTIONS   = None     # GLOBAL cap across whichever mode(s) you use.
+    LIMIT_QUESTIONS   = 5     # GLOBAL cap across whichever mode(s) you use.
                                 # Set to 1 to generate only the FIRST question.
     TRANSLATE         = True    # question_text -> English before generating (recommended)
 

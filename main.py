@@ -1086,7 +1086,7 @@ class VocabToPictures:
                        * Prefer visual learning over written text.
                        * Avoid unnecessary objects and background clutter.
 
-                    2. If the vocabulary is very difficult to represent visually:
+                    2. If the vocabulary is very difficult to represent visually like one word vocabulary (e.g. "is", "because", "however", "to be"):
 
                        * Create a clean educational flashcard, classroom whiteboard, notebook page, teaching poster, or vocabulary card.
                        * Show BOTH the original vocabulary and the English meaning.
@@ -1107,6 +1107,8 @@ class VocabToPictures:
                        * The vocabulary card should be the primary focus of the image.
                        * Use a clean classroom or language-learning environment.
                        * Make the image look like a professional educational resource.
+
+                    Try your best to avoid 2nd rule. Only use it when the word is truly unrepresentable visually. When in doubt, prefer rule 1.
 
                     General requirements:
 
