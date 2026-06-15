@@ -19,8 +19,29 @@ if __name__ == "__main__":
 
     # Exact lesson titles (one or many). For a single lesson, use a one-item list.
     TITLES = [
-        "unit3_basic_sentences",
-        # "unit5_basic_sentences",
+        # "unit8_basic_sentences",
+        # "unit9_basic_sentences",
+        # "unit10_basic_sentences",
+        # "unit11_basic_sentences",
+        # "unit12_basic_sentences",
+        # "unit13_basic_sentences",
+        # "unit14_basic_sentences",
+        # "unit15_basic_sentences",
+        # "unit16_basic_sentences",
+        "unit17_basic_sentences",
+        # "unit18_basic_sentences",
+        "unit19_basic_sentences",
+        # "unit20_basic_sentences",
+        # "unit21_basic_sentences",
+        # "unit22_basic_sentences",
+        # "unit23_basic_sentences",
+        # "unit24_basic_sentences",
+        # "unit25_basic_sentences",
+        # "unit26_basic_sentences",
+        "unit27_basic_sentences",
+        # "unit28_basic_sentences",
+        # "unit29_basic_sentences",
+        # "unit30_basic_sentences"
     ]
 
     # NOTE on UNITS: matching is a PREFIX match on title (unit{N}%), so UNITS=[2]
@@ -70,34 +91,37 @@ if __name__ == "__main__":
 
     with requests.post("http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com/generate-lesson-images",
                        json=payload, stream=True) as resp:
-        for raw in resp.iter_lines(decode_unicode=True):
-            if not raw:
-                continue
-            try:
-                ev = json.loads(raw)
-            except json.JSONDecodeError:
-                print(raw); continue
+        try:
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw:
+                    continue
+                try:
+                    ev = json.loads(raw)
+                except json.JSONDecodeError:
+                    print(raw); continue
 
-            e = ev.get("event")
-            if e == "start":
-                print(f"START generate-lesson-images | db={ev['database']} | translate={ev['translate']}")
-                print(f"  titles={ev.get('titles')} units={ev.get('units')} lessons={ev.get('lessons')}")
-            elif e == "found":
-                print(f"  questions needing images: {ev['total']}")
-            elif e == "processing":
-                print(f"  [{ev['n']}/{ev['total']}] {ev['lesson_title']} q{ev['question_id']} "
-                      f"(seq {ev['sequence_id']}): {ev['question_text']!r}")
-            elif e == "success":
-                print(f"       OK ({ev['row']}) -> {ev['image_url']}")
-            elif e == "failed":
-                print(f"       FAILED q{ev['question_id']}: {ev['error']}")
-            elif e == "lesson_error":
-                print(f"  LESSON ERROR {ev['lesson_id']}: {ev['error']}")
-            elif e == "summary":
-                print("=" * 50)
-                print(f"SUMMARY | items={ev['total_items']} succeeded={ev['succeeded']} failed={ev['failed']}")
-                print("=" * 50)
-            elif e == "error":
-                print(f"ERROR: {ev.get('message')}")
-            else:
-                print(raw)
+                e = ev.get("event")
+                if e == "start":
+                    print(f"START generate-lesson-images | db={ev['database']} | translate={ev['translate']}")
+                    print(f"  titles={ev.get('titles')} units={ev.get('units')} lessons={ev.get('lessons')}")
+                elif e == "found":
+                    print(f"  questions needing images: {ev['total']}")
+                elif e == "processing":
+                    print(f"  [{ev['n']}/{ev['total']}] {ev['lesson_title']} q{ev['question_id']} "
+                          f"(seq {ev['sequence_id']}): {ev['question_text']!r}")
+                elif e == "success":
+                    print(f"       OK ({ev['row']}) -> {ev['image_url']}")
+                elif e == "failed":
+                    print(f"       FAILED q{ev['question_id']}: {ev['error']}")
+                elif e == "lesson_error":
+                    print(f"  LESSON ERROR {ev['lesson_id']}: {ev['error']}")
+                elif e == "summary":
+                    print("=" * 50)
+                    print(f"SUMMARY | items={ev['total_items']} succeeded={ev['succeeded']} failed={ev['failed']}")
+                    print("=" * 50)
+                elif e == "error":
+                    print(f"ERROR: {ev.get('message')}")
+                else:
+                    print(raw)
+        except requests.exceptions.ChunkedEncodingError:
+            print("Stream interrupted. Re-run to continue remaining images.")
