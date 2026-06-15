@@ -5,17 +5,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE = "http://127.0.0.1:8000"
+BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"
 
 # --- choose ONE action ---
-ACTION = "delete-lessons"          # or "delete-questions"
+ACTION = "delete-questions"          # "delete-questions" or "delete-lessons"
 
 DATABASE = "spanish"
 DRY_RUN = True                     # True = preview + rollback; False = actually delete
 KEEP_USER_HISTORY = False          # True = don't delete userResponses / user_attempts rows
 
-LESSON_IDS = [1000]          # used when ACTION == "delete-lessons"  
-QUESTION_IDS = [1000]        # used when ACTION == "delete-questions"
+LESSON_IDS = None          # used when ACTION == "delete-lessons"  
+QUESTION_IDS = [43075]        # used when ACTION == "delete-questions"
 
 
 def run():

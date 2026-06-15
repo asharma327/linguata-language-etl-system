@@ -4410,14 +4410,14 @@ from fastapi.responses import StreamingResponse
 
 class DeleteQuestionsRequest(BaseModel):
     db: DBConfig
-    question_ids: list[int]
+    question_ids: list[int] | None = None
     keep_user_history: bool = False     # if True, leave userResponses / user_attempts rows intact
     dry_run: bool = True
 
 
 class DeleteLessonsRequest(BaseModel):
     db: DBConfig
-    lesson_ids: list[int]
+    lesson_ids: list[int] | None = None
     keep_user_history: bool = False
     dry_run: bool = True
 
