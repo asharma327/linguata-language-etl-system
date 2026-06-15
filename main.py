@@ -1,11 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse
-import socket
-import platform
-import time
-from datetime import datetime
 import pymysql
 import re
 import traceback
@@ -281,15 +276,9 @@ def make_create_if_not_exists(ddl: str) -> str:
 
 # --- Routes ---
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def root():
-    return """
-    <html>
-    <body>
-        <h1>HELLO WORLD</h1>
-    </body>
-    </html>
-    """
+    return {"status": "healthy"}
 
 @app.get("/test")
 def test():
