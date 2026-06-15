@@ -28,7 +28,6 @@ load_dotenv()
 
 app = FastAPI()
 
-START_TIME = time.time()
 
 # --- Pydantic Models ---
 
