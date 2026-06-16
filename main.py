@@ -4512,48 +4512,54 @@ def delete_questions(body: DeleteQuestionsRequest):
 
 # ----------------------------------------------------------------------------- 
 # DELETE LESSONS
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 @app.post("/delete-lessons")
 def delete_lessons(body: DeleteLessonsRequest):
 
     def stream():
-        target_ids = list(body.lesson_ids or [])
-        if body.titles:
-            ph = ",".join(["%s"] * len(body.titles))
-            cur.execute(f"SELECT lesson_id, title FROM Lesson WHERE title IN ({ph})", tuple(body.titles))
-            found = cur.fetchall()
-            found_titles = {r["title"] for r in found}
-            target_ids.extend(r["lesson_id"] for r in found)
-            # report any titles that didn't match, so a typo doesn't silently delete nothing
-            missing = [t for t in body.titles if t not in found_titles]
-            if missing:
-                yield _emit("warning", message="titles not found", titles=missing)
-        target_ids = sorted(set(target_ids))   # dedup in case a title and its id both given
-
-        if not target_ids:
-            yield _emit("error", message="No lessons to delete (no valid titles or lesson_ids)")
-            return
-
-        if not body.lesson_ids:
-            yield _emit("error", message="lesson_ids is empty")
-            return
-
+        # open the connection FIRST — title resolution needs a cursor
         try:
             conn = connect_to_db(body.db)
         except Exception as e:
             yield _emit("error", message=f"DB connection failed: {e}")
             return
 
+        # build the target id list from lesson_ids + resolved titles
+        target_ids = list(body.lesson_ids or [])
+        try:
+            if body.titles:
+                with conn.cursor() as cur:
+                    ph = ",".join(["%s"] * len(body.titles))
+                    cur.execute(f"SELECT lesson_id, title FROM Lesson WHERE title IN ({ph})",
+                                tuple(body.titles))
+                    found = cur.fetchall()
+                found_titles = {r["title"] for r in found}
+                target_ids.extend(r["lesson_id"] for r in found)
+                missing = [t for t in body.titles if t not in found_titles]
+                if missing:
+                    yield _emit("warning", message="titles not found", titles=missing)
+        except Exception as e:
+            conn.close()
+            yield _emit("error", message=f"Failed to resolve titles: {e}")
+            return
+
+        target_ids = sorted(set(target_ids))   # dedup if a title and its id both given
+
+        if not target_ids:
+            conn.close()
+            yield _emit("error", message="No lessons to delete (no valid titles or lesson_ids)")
+            return
+
         grand_totals: dict = {}
-        yield _emit("start", action="delete-lessons", count=len(body.lesson_ids),
+        yield _emit("start", action="delete-lessons", count=len(target_ids),
                     dry_run=body.dry_run, keep_user_history=body.keep_user_history)
-        logger.info("delete-lessons started | n=%d dry_run=%s", len(body.lesson_ids), body.dry_run)
+        logger.info("delete-lessons started | n=%d dry_run=%s", len(target_ids), body.dry_run)
 
         def bump(label, n):
             grand_totals[label] = grand_totals.get(label, 0) + n
 
         try:
-            for lid in body.lesson_ids:
+            for lid in target_ids:
                 with conn.cursor() as cur:
                     cur.execute("SELECT lesson_id, title, type FROM Lesson WHERE lesson_id = %s", (lid,))
                     lesson = cur.fetchone()
