@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-language = "spanish"
+language = "german"
 
 if __name__ == "__main__":
 
@@ -19,23 +19,14 @@ if __name__ == "__main__":
     # Lessons to process. One or many — for a single lesson use a one-item list.
     # Set TITLES = None to scan the whole database.
     TITLES = [
-        "unit1_basic_sentences",
-        # "unit22_basic_sentences",
-        # "unit23_basic_sentences",
-        # "unit24_basic_sentences",
-        # "unit25_basic_sentences",
-        # "unit26_basic_sentences",
-        # "unit27_basic_sentences",
-        # "unit28_basic_sentences",
-        # "unit29_basic_sentences",
-        # "unit30_basic_sentences",
+        "unit9_translation_drill"
     ]
 
     LIMIT = None  # limit number of questions to process (for testing); set to None for no limit
 
     TTS_MODEL = "gpt-4o-mini-tts"
     SOURCE_LANGUAGE = "en"
-    TARGET_LANGUAGE = "es"
+    TARGET_LANGUAGE = "de"
 
     OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
     AWS_ACCESS_KEY_ID = os.environ["AWS_ACCESS_KEY_ID"]
@@ -62,7 +53,7 @@ if __name__ == "__main__":
     if LIMIT:
         payload["limit"] = LIMIT
 
-    with requests.post("http://localhost:8000/generate-vocab-audio",
+    with requests.post("http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com/generate-vocab-audio",
                        json=payload, stream=True) as resp:
         for raw in resp.iter_lines(decode_unicode=True):
             if not raw:

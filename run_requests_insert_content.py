@@ -5,21 +5,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE = "http://127.0.0.1:8000"
+BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"
 DATABASE = "german"
-DRY_RUN = True
+DRY_RUN = False    # True = preview + rollback; False = actually insert
 
 # Target the lesson by title (preferred) or lesson_id.
-TITLE = "unit4_translation_drill"
+TITLE = "unit15_variation_drill"
 LESSON_ID = None
 
 # Put ONLY the new items here — not the whole lesson.
 # Vocabulary / writing / grammar question = single answer:
 QUESTIONS_AND_ANSWERS = [
     {
-        "question_text": "Herr Jones möchte wissen:",
-        "answers": [{"answer_text": "Mr. Jones would like to know:", "is_correct": True}],
-    },
+        "question_text": "Das Visum ist im Konsulat zu beantragen.",
+        "answers": [{"answer_text": "The visa should be applied for at the consulate", "is_correct": True}],
+    }
 ]
 
 # Reading / listening question = four options with one correct:

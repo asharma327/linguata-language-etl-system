@@ -415,7 +415,7 @@ def insert_lessons(body: InsertLessonsRequest):
 
         # --- Parse JSON ---
         try:
-            data = json.loads(json_file.read_text(encoding="utf-8-sig"))
+            raw_data = json.loads(json_file.read_text(encoding="utf-8-sig"))
         except Exception as e:
             file_log["status"] = "failed"
             file_log["errors"].append(f"JSON parse error: {e}")
@@ -4417,6 +4417,7 @@ class DeleteQuestionsRequest(BaseModel):
 
 class DeleteLessonsRequest(BaseModel):
     db: DBConfig
+    titles: list[str] | None = None      
     lesson_ids: list[int] | None = None
     keep_user_history: bool = False
     dry_run: bool = True
@@ -4516,6 +4517,23 @@ def delete_questions(body: DeleteQuestionsRequest):
 def delete_lessons(body: DeleteLessonsRequest):
 
     def stream():
+        target_ids = list(body.lesson_ids or [])
+        if body.titles:
+            ph = ",".join(["%s"] * len(body.titles))
+            cur.execute(f"SELECT lesson_id, title FROM Lesson WHERE title IN ({ph})", tuple(body.titles))
+            found = cur.fetchall()
+            found_titles = {r["title"] for r in found}
+            target_ids.extend(r["lesson_id"] for r in found)
+            # report any titles that didn't match, so a typo doesn't silently delete nothing
+            missing = [t for t in body.titles if t not in found_titles]
+            if missing:
+                yield _emit("warning", message="titles not found", titles=missing)
+        target_ids = sorted(set(target_ids))   # dedup in case a title and its id both given
+
+        if not target_ids:
+            yield _emit("error", message="No lessons to delete (no valid titles or lesson_ids)")
+            return
+
         if not body.lesson_ids:
             yield _emit("error", message="lesson_ids is empty")
             return

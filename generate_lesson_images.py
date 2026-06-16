@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-language = "spanish"  
+language = "german"  
 
 if __name__ == "__main__":
     DB = {
@@ -19,29 +19,10 @@ if __name__ == "__main__":
 
     # Exact lesson titles (one or many). For a single lesson, use a one-item list.
     TITLES = [
-        # "unit8_basic_sentences",
-        # "unit9_basic_sentences",
-        # "unit10_basic_sentences",
-        # "unit11_basic_sentences",
-        # "unit12_basic_sentences",
-        # "unit13_basic_sentences",
-        # "unit14_basic_sentences",
-        # "unit15_basic_sentences",
-        # "unit16_basic_sentences",
-        # "unit17_basic_sentences",
-        # "unit18_basic_sentences",
-        # "unit19_basic_sentences",
-        # "unit20_basic_sentences",
-        # "unit21_basic_sentences",
-        # "unit22_basic_sentences",
-        # "unit23_basic_sentences",
-        # "unit24_basic_sentences",
-        # "unit25_basic_sentences",
-        # "unit26_basic_sentences",
-        # "unit27_basic_sentences",
-        # "unit28_basic_sentences",
-        # "unit29_basic_sentences",
-        # "unit30_basic_sentences"
+        "unit9_translation_drill",
+        "unit2_finder_list",
+        "unit3_finder_list",
+        "unit4_finder_list",
     ]
 
     # NOTE on UNITS: matching is a PREFIX match on title (unit{N}%), so UNITS=[2]
