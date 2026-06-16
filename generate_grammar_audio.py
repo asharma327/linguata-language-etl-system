@@ -24,7 +24,7 @@ if __name__ == "__main__":
     # OPTION 1: exact lesson titles (one or many)
     # ----------------------------------------------------------
     TITLES = [
-        # "unit21_grammar",
+        "unit1_grammar_do_the_japanese_understand_english"
         # "unit22_grammar",
     ]
 
@@ -80,7 +80,7 @@ if __name__ == "__main__":
     print(f"Limit Articles: {LIMIT_ARTICLES}")
     print("=" * 70)
 
-    with requests.post("http://localhost:8010/generate-grammar-audio",
+    with requests.post("http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com/generate-grammar-audio",
                        json=payload, stream=True, timeout=3600) as resp:
         for raw in resp.iter_lines(decode_unicode=True):
             if not raw:

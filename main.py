@@ -1572,7 +1572,7 @@ class GrammarScriptToAudio:
     """
 
     SCRIPT_MODEL = "gpt-5-mini"
-    TTS_MODEL = "gpt-4o-tts"
+    TTS_MODEL = "gpt-4o-mini-tts"
 
     def __init__(self, database_name: str, api_key: str | None = None):
         self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
