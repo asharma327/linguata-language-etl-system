@@ -85,18 +85,6 @@ class GrammarAudioTarget(BaseModel):
     article_ids: list[int] | None = None  # if None → all articles for the lesson
 
 
-class GenerateGrammarAudioRequest(BaseModel):
-    db: DBConfig
-    units: list[int] | None = None                    # path 1: select grammar lessons by unit number
-    lessons: list[GrammarAudioTarget] | None = None   # path 2: explicit lesson/article targets
-    limit_articles: int = 200                         # max articles to process (units path)
-    s3_bucket: str
-    s3_prefix: str = "spanish"
-    aws_region: str = "us-east-1"
-    openai_api_key: str | None = None                 # falls back to OPENAI_API_KEY env var
-    aws_access_key_id: str | None = None              # falls back to AWS_ACCESS_KEY_ID env var
-    aws_secret_access_key: str | None = None          # falls back to AWS_SECRET_ACCESS_KEY env var
-
 
 class GenerateListeningQuestionsRequest(BaseModel):
     db: DBConfig
@@ -986,54 +974,6 @@ def _insert_vocab_audio_row(conn, lesson_id: int, question_id: int,
             raise
 
 
-# --- GrammarScriptToAudio class ---
-
-class GrammarScriptToAudio:
-    """
-    Converts a grammar article into an instructional audio clip entirely in memory.
-    Step 1 — generate_script(): rewrites raw content into a 100–120 word narration.
-    Step 2 — generate_audio_bytes(): synthesises the script to MP3 bytes via TTS.
-    """
-
-    SCRIPT_MODEL = "gpt-5-mini"
-    TTS_MODEL = "gpt-4o-mini-tts"
-    TTS_VOICE = "marin"
-    TTS_INSTRUCTIONS = (
-        "Use a warm, friendly, teacher-like adult female voice. "
-        "Speak slowly and clearly with gentle pauses. "
-        "Sound encouraging, calm, and natural."
-    )
-
-    def __init__(self, api_key: str | None = None):
-        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
-
-    def generate_script(self, content: str) -> str:
-        """Rewrite grammar article content into a 100–120 word instructional script."""
-        prompt = (
-            "You are a helpful educator. Rewrite the following into a clear, friendly, "
-            "instructional script that is between 100 and 120 words. Keep it positive, "
-            "encouraging, and easy to follow. Do not include any extra commentary, only the script. "
-            "Make sure it is smooth and natural, as it will be translated to speech."
-            "Make sure the script is direct and to the point without any introduction or preamble. "
-            "This will be used on a Duolingo-style app but for working professionals, "
-            "so the script should be to the point and get the information across quickly and directly.\n\n"
-            f"Content:\n{content}\n\n"
-            "Output:"
-        )
-        response = self.client.responses.create(model=self.SCRIPT_MODEL, input=prompt)
-        return response.output_text.strip()
-
-    def generate_audio_bytes(self, script: str) -> bytes:
-        """Synthesise script to MP3 and return raw bytes (no disk I/O)."""
-        response = self.client.audio.speech.create(
-            model=self.TTS_MODEL,
-            voice=self.TTS_VOICE,
-            input=script,
-            instructions=self.TTS_INSTRUCTIONS,
-        )
-        return response.content
-
-
 # --- VocabToPictures class (unchanged) ---
 
 class VocabToPictures:
@@ -1409,176 +1349,453 @@ def generate_lesson_images(body: GenerateImagesRequest):
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
+class GenerateGrammarAudioRequest(BaseModel):
+    db: DBConfig
+    units: list[int] | None = None                    # path 1: select grammar lessons by unit number
+    lessons: list[GrammarAudioTarget] | None = None   # path 2: explicit lesson/article targets
+    titles: list[str] | None = None
+    limit_articles: int | None = None     # change from `int = 200` so None means "no cap"  # max articles to process (units path)
+    s3_bucket: str
+    s3_prefix: str = "spanish"
+    aws_region: str = "us-east-1"
+    openai_api_key: str | None = None                 # falls back to OPENAI_API_KEY env var
+    aws_access_key_id: str | None = None              # falls back to AWS_ACCESS_KEY_ID env var
+    aws_secret_access_key: str | None = None          # falls back to AWS_SECRET_ACCESS_KEY env var
+
+# --- GrammarScriptToAudio class ---
+
+def get_grammar_tts_settings(database_name: str):
+    database_name = database_name.lower().strip()
+
+    settings = {
+
+        "hindi": {
+            "voice": "marin",
+            "instructions": """
+                Speak as an experienced Hindi language instructor from India.
+
+                Use authentic Indian pronunciation, rhythm, and intonation.
+
+                This audio is for adult language learners.
+
+                Speak clearly and confidently.
+
+                Use a calm, patient, professional teaching style.
+
+                Speak at approximately 85% of normal conversational speed.
+
+                Pause naturally between ideas.
+
+                Emphasize important grammar words and example phrases.
+
+                Do not sound rushed.
+
+                Maintain natural speech and avoid sounding robotic.
+
+                The lesson should feel like a premium language-learning course.
+                """
+                        },
+
+                        "spanish": {
+                            "voice": "marin",
+                            "instructions": """
+                Speak as an experienced Spanish language instructor.
+
+                Use authentic Spanish pronunciation, rhythm, and intonation.
+
+                This audio is for adult language learners.
+
+                Speak clearly and confidently.
+
+                Use a calm, patient, professional teaching style.
+
+                Speak at approximately 85% of normal conversational speed.
+
+                Pause naturally between ideas.
+
+                Emphasize important grammar words and example phrases.
+
+                Do not sound rushed.
+
+                Maintain natural speech and avoid sounding robotic.
+
+                The lesson should feel like a premium language-learning course.
+                """
+                        },
+
+                        "japanese": {
+                            "voice": "marin",
+                            "instructions": """
+                Speak as an experienced Japanese language instructor from Japan.
+
+                Use authentic Japanese pronunciation, rhythm, pitch patterns, and intonation.
+
+                This audio is for adult language learners.
+
+                Speak clearly and confidently.
+
+                Use a calm, patient, professional teaching style.
+
+                Speak at approximately 85% of normal conversational speed.
+
+                Pause naturally between ideas.
+
+                Emphasize important grammar words and example phrases.
+
+                Do not sound rushed.
+
+                Maintain natural speech and avoid sounding robotic.
+
+                The lesson should feel like a premium language-learning course.
+                """
+                        },
+
+                        "german": {
+                            "voice": "marin",
+                            "instructions": """
+                Speak as an experienced German language instructor from Germany.
+
+                Use authentic German pronunciation, rhythm, and intonation.
+
+                This audio is for adult language learners.
+
+                Speak clearly and confidently.
+
+                Use a calm, patient, professional teaching style.
+
+                Speak at approximately 85% of normal conversational speed.
+
+                Pause naturally between ideas.
+
+                Emphasize important grammar words and example phrases.
+
+                Do not sound rushed.
+
+                Maintain natural speech and avoid sounding robotic.
+
+                The lesson should feel like a premium language-learning course.
+                """
+                        },
+
+                        "french": {
+                            "voice": "marin",
+                            "instructions": """
+                Speak as an experienced French language instructor from France.
+
+                Use authentic French pronunciation, rhythm, and intonation.
+
+                This audio is for adult language learners.
+
+                Speak clearly and confidently.
+
+                Use a calm, patient, professional teaching style.
+
+                Speak at approximately 85% of normal conversational speed.
+
+                Pause naturally between ideas.
+
+                Emphasize important grammar words and example phrases.
+
+                Do not sound rushed.
+
+                Maintain natural speech and avoid sounding robotic.
+
+                The lesson should feel like a premium language-learning course.
+                """
+                        },
+
+                        "italian": {
+                            "voice": "marin",
+                            "instructions": """
+                Speak as an experienced Italian language instructor from Italy.
+
+                Use authentic Italian pronunciation, rhythm, and intonation.
+
+                This audio is for adult language learners.
+
+                Speak clearly and confidently.
+
+                Use a calm, patient, professional teaching style.
+
+                Speak at approximately 85% of normal conversational speed.
+
+                Pause naturally between ideas.
+
+                Emphasize important grammar words and example phrases.
+
+                Do not sound rushed.
+
+                Maintain natural speech and avoid sounding robotic.
+
+                The lesson should feel like a premium language-learning course.
+                """
+                        },
+
+                        "chinese": {
+                            "voice": "marin",
+                            "instructions": """
+                Speak as an experienced Mandarin Chinese language instructor.
+
+                Use authentic Mandarin pronunciation, tones, rhythm, and intonation.
+
+                This audio is for adult language learners.
+
+                Speak clearly and confidently.
+
+                Use a calm, patient, professional teaching style.
+
+                Speak at approximately 85% of normal conversational speed.
+
+                Pause naturally between ideas.
+
+                Emphasize important grammar words and example phrases.
+
+                Do not sound rushed.
+
+                Maintain natural speech and avoid sounding robotic.
+
+                The lesson should feel like a premium language-learning course.
+                """
+        }
+    }
+
+    if database_name not in settings:
+        raise ValueError(f"Unsupported database: {database_name}")
+
+    return settings[database_name]
+
+class GrammarScriptToAudio:
+    """
+    Converts a grammar article into an instructional audio clip entirely in memory.
+    Step 1 — generate_script(): rewrites raw content into a 100–120 word narration.
+    Step 2 — generate_audio_bytes(): synthesises the script to MP3 bytes via TTS.
+    """
+
+    SCRIPT_MODEL = "gpt-5-mini"
+    TTS_MODEL = "gpt-4o-tts"
+
+    def __init__(self, database_name: str, api_key: str | None = None):
+        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        tts_settings = get_grammar_tts_settings(database_name)
+        self.voice = tts_settings["voice"]
+        self.instructions = tts_settings["instructions"]
+
+    def generate_script(self, content: str) -> str:
+        """Rewrite grammar article content into a 100–120 word instructional script."""
+        prompt = f"""
+            You are an expert language-learning instructor creating short grammar lesson audio for a premium language-learning application aimed at adult professionals.
+
+            Transform the grammar content below into a spoken lesson script.
+
+            Requirements:
+
+            - Length: approximately 70–100 words.
+            - Speak directly to the learner.
+            - Start immediately with the grammar concept.
+            - Do not include greetings.
+            - Do not include introductions.
+            - Do not include lesson titles.
+            - Do not include conclusions or summaries.
+            - Do not say:
+              - "Today we will learn..."
+              - "In this lesson..."
+              - "Let's learn..."
+              - "Let's talk about..."
+            - Explain the grammar rule clearly and efficiently.
+            - Use simple, natural language.
+            - Include one or two short examples if helpful.
+            - Prioritize practical understanding over technical terminology.
+            - Sound like a skilled language tutor.
+            - Keep the pace concise and engaging.
+            - Avoid repetition.
+            - The script must sound natural when spoken aloud.
+            - Output only the final narration script.
+
+            Grammar Content:
+
+            {content}
+        """
+        response = self.client.responses.create(model=self.SCRIPT_MODEL, input=prompt)
+        return response.output_text.strip()
+
+    def generate_audio_bytes(self, script: str) -> bytes:
+        """Synthesise script to MP3 and return raw bytes (no disk I/O)."""
+        response = self.client.audio.speech.create(
+            model=self.TTS_MODEL,
+            voice=self.voice,
+            input=script,
+            instructions=self.instructions,
+        )
+        return response.content
+
 @app.post("/generate-grammar-audio")
 def generate_grammar_audio(body: GenerateGrammarAudioRequest):
     """
-    Generates instructional audio for grammar lesson articles and stores them in S3 + Audio table.
+    Streams NDJSON progress while generating instructional audio for grammar lesson articles
+    and uploading them to S3. Returns the S3 URL per article.
 
-    Two input modes (can combine both):
-      - units: auto-selects all grammar articles for those unit numbers (skips articles that
-               already have audio)
-      - lessons: explicit list of {lesson_id, article_ids?}
-                 If article_ids is omitted → all articles for that lesson
+    Three input modes (combinable):
+      - titles:  exact grammar lesson titles (one or many)
+      - units:   all grammar articles whose lesson title matches ^unit{N}_
+      - lessons: explicit [{lesson_id, article_ids?}]
+
+    NOTE: this route does NOT write to the database — it only generates the MP3 and returns
+    its URL (grammar audio feeds the external video step). There is no skip-if-present, so
+    re-running regenerates everything in scope.
+
+    limit_articles is a GLOBAL cap applied after the work list is built and ordered
+    (lesson_id, sequence_id) — limit_articles=1 generates only the first article.
     """
-    if not body.units and not body.lessons:
-        raise HTTPException(status_code=400, detail="Provide at least one of 'units' or 'lessons'")
 
-    try:
-        conn = connect_to_db(body.db)
-    except Exception as e:
-        print(traceback.format_exc())
-        raise HTTPException(status_code=400, detail=f"Could not connect to database: {e}")
-
-    # --- Build work list ---
-    # Each item: {lesson_id, article_id, content, lesson_title, sequence_id}
-    work_items: list[dict] = []
-
-    try:
-        with conn.cursor() as cur:
-
-            # Path 1: units → all grammar articles
-            if body.units:
-                regexp_clauses = " OR ".join(["l.title REGEXP %s" for _ in body.units])
-                regexp_params = [f"^unit{u}_" for u in body.units]
-                cur.execute(f"""
-                    SELECT a.article_id, a.lesson_id, a.sequence_id, a.content, l.title
-                    FROM Article a
-                    JOIN Lesson l ON l.lesson_id = a.lesson_id
-                    WHERE ({regexp_clauses})
-                      AND l.type = 'grammar'
-                    LIMIT %s
-                """, (*regexp_params, body.limit_articles))
-                for row in cur.fetchall():
-                    work_items.append({
-                        "lesson_id": row["lesson_id"],
-                        "article_id": row["article_id"],
-                        "sequence_id": row["sequence_id"],
-                        "content": row["content"],
-                        "lesson_title": row["title"],
-                    })
-
-            # Path 2: explicit lesson targets
-            if body.lessons:
-                for target in body.lessons:
-                    cur.execute(
-                        "SELECT lesson_id, title, type FROM Lesson WHERE lesson_id = %s",
-                        (target.lesson_id,),
-                    )
-                    lesson_row = cur.fetchone()
-                    if not lesson_row:
-                        work_items.append({
-                            "lesson_id": target.lesson_id,
-                            "error": f"Lesson {target.lesson_id} not found",
-                        })
-                        continue
-
-                    if lesson_row["type"] != "grammar":
-                        work_items.append({
-                            "lesson_id": target.lesson_id,
-                            "error": (
-                                f"Lesson {target.lesson_id} is type '{lesson_row['type']}' — "
-                                "only grammar lessons are supported by this route"
-                            ),
-                        })
-                        continue
-
-                    if target.article_ids:
-                        fmt = ",".join(["%s"] * len(target.article_ids))
-                        cur.execute(
-                            f"SELECT article_id, sequence_id, content FROM Article "
-                            f"WHERE lesson_id = %s AND article_id IN ({fmt})",
-                            (target.lesson_id, *target.article_ids),
-                        )
-                    else:
-                        cur.execute(
-                            "SELECT article_id, sequence_id, content FROM Article WHERE lesson_id = %s",
-                            (target.lesson_id,),
-                        )
-
-                    for arow in cur.fetchall():
-                        work_items.append({
-                            "lesson_id": target.lesson_id,
-                            "article_id": arow["article_id"],
-                            "sequence_id": arow["sequence_id"],
-                            "content": arow["content"],
-                            "lesson_title": lesson_row["title"],
-                        })
-
-    except Exception as e:
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"Failed to build work list: {e}")
-
-    # --- Generate audio ---
-    generator = GrammarScriptToAudio(api_key=body.openai_api_key)
-
-    results = []
-    total_succeeded = total_failed = 0
-
-    for item in work_items:
-        # Items without article_id are pre-flagged errors (e.g. lesson not found)
-        if "error" in item:
-            results.append({
-                "lesson_id": item["lesson_id"],
-                "status": "failed",
-                "error": item["error"],
-            })
-            total_failed += 1
-            continue
-
-        log = {
-            "lesson_id": item["lesson_id"],
-            "article_id": item["article_id"],
-            "lesson_title": item["lesson_title"],
-            "status": None,
-            "audio_url": None,
-            "error": None,
-        }
+    def stream():
+        if not body.titles and not body.units and not body.lessons:
+            yield _emit("error", message="Provide at least one of 'titles', 'units', or 'lessons'")
+            return
 
         try:
-            # 1) Rewrite content into instructional script
-            script = generator.generate_script(item["content"])
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"Could not connect to database: {e}")
+            return
 
-            # 2) Synthesise to MP3 bytes (no disk I/O)
-            audio_bytes = generator.generate_audio_bytes(script)
+        yield _emit("start", action="generate-grammar-audio", database=body.db.database,
+                    titles=body.titles or None, units=body.units or None,
+                    lessons=[t.lesson_id for t in body.lessons] if body.lessons else None)
 
-            # 3) Upload to S3
-            key = (
-                f"{body.s3_prefix}/"
-                f"{item['lesson_id']}_{item['article_id']}_"
-                f"{_safe_slug(item['lesson_title'])}.mp3"
-            )
-            public_url = _upload_to_s3_public(
-                audio_bytes, key, body.s3_bucket, body.aws_region,
-                body.aws_access_key_id, body.aws_secret_access_key,
-                content_type="audio/mpeg",
-            )
+        work_items: list[dict] = []
+        seen: set = set()  # (lesson_id, article_id) dedup across modes
 
-            log["status"] = "success"
-            log["audio_url"] = public_url
-            total_succeeded += 1
+        def _add(row, title):
+            key = (row["lesson_id"], row["article_id"])
+            if key in seen:
+                return
+            seen.add(key)
+            work_items.append({
+                "lesson_id": row["lesson_id"],
+                "article_id": row["article_id"],
+                "sequence_id": row.get("sequence_id", 0),
+                "content": row["content"],
+                "lesson_title": title,
+            })
+
+        try:
+            with conn.cursor() as cur:
+
+                # Path 1: titles (exact match)
+                if body.titles:
+                    ph = ",".join(["%s"] * len(body.titles))
+                    cur.execute(f"""
+                        SELECT a.article_id, a.lesson_id, a.sequence_id, a.content, l.title
+                        FROM Article a
+                        JOIN Lesson l ON l.lesson_id = a.lesson_id
+                        WHERE l.type = 'grammar' AND l.title IN ({ph})
+                    """, tuple(body.titles))
+                    for r in cur.fetchall():
+                        _add(r, r["title"])
+
+                # Path 2: units (REGEXP prefix, exact unit boundary)
+                if body.units:
+                    regexp_clauses = " OR ".join(["l.title REGEXP %s" for _ in body.units])
+                    regexp_params = [f"^unit{u}_" for u in body.units]
+                    cur.execute(f"""
+                        SELECT a.article_id, a.lesson_id, a.sequence_id, a.content, l.title
+                        FROM Article a
+                        JOIN Lesson l ON l.lesson_id = a.lesson_id
+                        WHERE ({regexp_clauses}) AND l.type = 'grammar'
+                    """, tuple(regexp_params))
+                    for r in cur.fetchall():
+                        _add(r, r["title"])
+
+                # Path 3: explicit lessons
+                if body.lessons:
+                    for target in body.lessons:
+                        cur.execute("SELECT lesson_id, title, type FROM Lesson WHERE lesson_id = %s",
+                                    (target.lesson_id,))
+                        lesson_row = cur.fetchone()
+                        if not lesson_row:
+                            yield _emit("lesson_error", lesson_id=target.lesson_id, error="lesson not found")
+                            continue
+                        if lesson_row["type"] != "grammar":
+                            yield _emit("lesson_error", lesson_id=target.lesson_id,
+                                        error=f"lesson type '{lesson_row['type']}' — only grammar supported")
+                            continue
+
+                        if target.article_ids:
+                            fmt = ",".join(["%s"] * len(target.article_ids))
+                            cur.execute(
+                                f"SELECT article_id, lesson_id, sequence_id, content FROM Article "
+                                f"WHERE lesson_id = %s AND article_id IN ({fmt})",
+                                (target.lesson_id, *target.article_ids),
+                            )
+                        else:
+                            cur.execute(
+                                "SELECT article_id, lesson_id, sequence_id, content FROM Article "
+                                "WHERE lesson_id = %s",
+                                (target.lesson_id,),
+                            )
+                        for r in cur.fetchall():
+                            _add(r, lesson_row["title"])
 
         except Exception as e:
-            log["status"] = "failed"
-            log["error"] = str(e)
-            total_failed += 1
+            conn.close()
+            yield _emit("error", message=f"Failed to build work list: {e}")
+            return
 
-        results.append(log)
+        # order globally, then apply the global cap
+        work_items.sort(key=lambda w: (w["lesson_id"], w["sequence_id"]))
+        if body.limit_articles is not None:
+            work_items = work_items[: int(body.limit_articles)]
 
-    conn.close()
+        yield _emit("found", total=len(work_items))
+        if not work_items:
+            conn.close()
+            yield _emit("summary", total_items=0, succeeded=0, failed=0)
+            return
 
-    all_ok = total_failed == 0
-    return JSONResponse(
-        content={
-            "status": "ok" if all_ok else "partial",
-            "summary": {
-                "total_items": len(work_items),
-                "succeeded": total_succeeded,
-                "failed": total_failed,
-            },
-            "results": results,
-        },
-        status_code=200 if all_ok else 207,
-    )
+        generator = GrammarScriptToAudio(database_name=body.db.database, api_key=body.openai_api_key)
+        succeeded = failed = 0
+
+        try:
+            for idx, item in enumerate(work_items, start=1):
+                yield _emit("processing", n=idx, total=len(work_items),
+                            lesson_title=item["lesson_title"], lesson_id=item["lesson_id"],
+                            article_id=item["article_id"], sequence_id=item["sequence_id"])
+                try:
+                    # 1) rewrite content into instructional script
+                    script = generator.generate_script(item["content"])
+                    # 2) synthesise to MP3 bytes (no disk I/O)
+                    audio_bytes = generator.generate_audio_bytes(script)
+                    # 3) upload to S3
+                    key = (f"{body.s3_prefix}/"
+                           f"{item['lesson_id']}_{item['article_id']}_"
+                           f"{_safe_slug(item['lesson_title'])}.mp3")
+                    public_url = _upload_to_s3_public(
+                        audio_bytes, key, body.s3_bucket, body.aws_region,
+                        body.aws_access_key_id, body.aws_secret_access_key,
+                        content_type="audio/mpeg",
+                    )
+                    succeeded += 1
+                    yield _emit("success", lesson_id=item["lesson_id"], article_id=item["article_id"],
+                                sequence_id=item["sequence_id"], lesson_title=item["lesson_title"],
+                                audio_url=public_url)
+
+                except Exception as e:
+                    failed += 1
+                    yield _emit("failed", lesson_id=item["lesson_id"], article_id=item["article_id"],
+                                sequence_id=item["sequence_id"], lesson_title=item["lesson_title"],
+                                error=str(e))
+
+            yield _emit("summary", total_items=len(work_items), succeeded=succeeded, failed=failed)
+            logger.info("generate-grammar-audio done | items=%d ok=%d fail=%d",
+                        len(work_items), succeeded, failed)
+
+        except Exception as e:
+            logger.error("generate-grammar-audio crashed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e))
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 @app.post("/generate-listening-questions")
