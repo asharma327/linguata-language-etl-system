@@ -5906,4 +5906,174 @@ def sync_vocab_lesson(body: SyncVocabLessonRequest):
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
+# =============================================================================
+#  Add to main.py  —  /link-listening-unit-images
+#
+#  For each unit, stamp that unit's image onto EVERY question in EVERY listening
+#  lesson of that unit (question-level images).
+#
+#  Per unit (unit_number is a VARCHAR in UnitImages, so we match as a string):
+#    1. UnitImages   -> image_id for this unit_number
+#    2. Image        -> image_url for that image_id   (the source url to copy)
+#    3. Lesson       -> type='listening' AND title REGEXP '^unit{N}_'  -> their questions
+#    4. Per question:
+#         - Image row exists -> UPDATE image_url   (overwrite, per spec)
+#         - no Image row      -> INSERT one via _insert_image_row
+#
+#  Streams NDJSON. dry_run=True (default): reports the plan per unit, writes nothing,
+#  rolls back. Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse /
+#  _insert_image_row / pymysql / json.
+# =============================================================================
+
+
+class LinkListeningUnitImagesRequest(BaseModel):
+    db: DBConfig
+    units: list[int]                 # unit numbers; matched as strings against UnitImages.unit_number
+    dry_run: bool = True
+
+
+@app.post("/link-listening-unit-images")
+def link_listening_unit_images(body: LinkListeningUnitImagesRequest):
+
+    def stream():
+        if not body.units:
+            yield _emit("error", message="Provide at least one unit in 'units'")
+            return
+
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        yield _emit("start", action="link-listening-unit-images",
+                    database=body.db.database, units=body.units, dry_run=body.dry_run)
+
+        grand = {"units": 0, "updated": 0, "inserted": 0,
+                 "questions": 0, "lessons": 0, "skipped_units": 0}
+
+        try:
+            for unit in body.units:
+                unit_str = str(unit)
+
+                # 1) UnitImages -> image_id for this unit
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT image_id FROM UnitImages WHERE unit_number = %s "
+                        "ORDER BY id DESC LIMIT 1",
+                        (unit_str,),
+                    )
+                    uirow = cur.fetchone()
+                if not uirow or not uirow.get("image_id"):
+                    grand["skipped_units"] += 1
+                    yield _emit("unit_skipped", unit=unit, reason="no row in UnitImages")
+                    continue
+                source_image_id = uirow["image_id"]
+
+                # 2) Image -> image_url for that image_id
+                with conn.cursor() as cur:
+                    cur.execute("SELECT image_url FROM Image WHERE image_id = %s", (source_image_id,))
+                    imgrow = cur.fetchone()
+                source_url = (imgrow or {}).get("image_url")
+                if not source_url or not str(source_url).strip():
+                    grand["skipped_units"] += 1
+                    yield _emit("unit_skipped", unit=unit, image_id=source_image_id,
+                                reason="source Image has no usable image_url")
+                    continue
+
+                # 3) listening lessons in this unit + their questions
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT lesson_id, title FROM Lesson "
+                        "WHERE type = 'listening' AND title REGEXP %s ORDER BY lesson_id",
+                        (f"^unit{unit}_",),
+                    )
+                    lessons = cur.fetchall()
+
+                if not lessons:
+                    yield _emit("unit_done", unit=unit, image_id=source_image_id,
+                                lessons=0, questions=0, updated=0, inserted=0,
+                                note="no listening lessons matched")
+                    continue
+
+                yield _emit("unit_start", unit=unit, image_id=source_image_id,
+                            image_url=source_url, listening_lessons=len(lessons))
+
+                unit_updated = unit_inserted = unit_questions = 0
+
+                for lrow in lessons:
+                    lid = lrow["lesson_id"]
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT question_id FROM Question WHERE lesson_id = %s ORDER BY sequence_id", (lid,))
+                        qids = [r["question_id"] for r in cur.fetchall()]
+
+                    l_upd = l_ins = 0
+                    for qid in qids:
+                        unit_questions += 1
+                        # does this question already have an Image row?
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT image_id FROM Image WHERE lesson_id = %s AND question_id = %s "
+                                "ORDER BY image_id ASC LIMIT 1",
+                                (lid, qid),
+                            )
+                            existing = cur.fetchone()
+
+                        if not body.dry_run:
+                            if existing:
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        "UPDATE Image SET image_url = %s WHERE image_id = %s",
+                                        (source_url, existing["image_id"]),
+                                    )
+                            else:
+                                meta = json.dumps({
+                                    "source": "unit_image",
+                                    "unit": unit,
+                                    "source_image_id": source_image_id,
+                                }, ensure_ascii=False)
+                                _insert_image_row(
+                                    conn,
+                                    lesson_id=lid,
+                                    question_id=qid,
+                                    image_url=source_url,
+                                    image_metadata_json=meta,
+                                )
+
+                        if existing:
+                            l_upd += 1; unit_updated += 1
+                        else:
+                            l_ins += 1; unit_inserted += 1
+
+                    yield _emit("lesson_done", unit=unit, lesson_id=lid, title=lrow["title"],
+                                questions=len(qids), updated=l_upd, inserted=l_ins)
+
+                # commit per unit (or roll back on dry run)
+                if body.dry_run:
+                    conn.rollback()
+                else:
+                    conn.commit()
+
+                grand["units"] += 1
+                grand["lessons"] += len(lessons)
+                grand["questions"] += unit_questions
+                grand["updated"] += unit_updated
+                grand["inserted"] += unit_inserted
+
+                yield _emit("unit_done", unit=unit, image_id=source_image_id,
+                            lessons=len(lessons), questions=unit_questions,
+                            updated=unit_updated, inserted=unit_inserted)
+
+            yield _emit("summary", dry_run=body.dry_run, totals=grand)
+            logger.info("link-listening-unit-images done | dry_run=%s totals=%s", body.dry_run, grand)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("link-listening-unit-images failed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
 lambda_handler = Mangum(app)

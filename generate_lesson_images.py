@@ -19,10 +19,7 @@ if __name__ == "__main__":
 
     # Exact lesson titles (one or many). For a single lesson, use a one-item list.
     TITLES = [
-        "unit9_translation_drill",
-        "unit2_finder_list",
-        "unit3_finder_list",
-        "unit4_finder_list",
+        "unit24_finder_list",
     ]
 
     # NOTE on UNITS: matching is a PREFIX match on title (unit{N}%), so UNITS=[2]

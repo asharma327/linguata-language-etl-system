@@ -6,19 +6,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"
-DATABASE = "german"
+DATABASE = "italian"
 DRY_RUN = False    # True = preview + rollback; False = actually insert
 
 # Target the lesson by title (preferred) or lesson_id.
-TITLE = "unit15_variation_drill"
+TITLE = "unit11_model8"
 LESSON_ID = None
 
 # Put ONLY the new items here — not the whole lesson.
 # Vocabulary / writing / grammar question = single answer:
 QUESTIONS_AND_ANSWERS = [
     {
-        "question_text": "Das Visum ist im Konsulat zu beantragen.",
-        "answers": [{"answer_text": "The visa should be applied for at the consulate", "is_correct": True}],
+        "question_text": "Che giorno era ieri?",
+        "answers": [{"answer_text": "Ieri era domenica.", "is_correct": True}],
+    },
+    {
+        "question_text": "Che giorno sarà domani?",
+        "answers": [{"answer_text": "Domani sarà martedì.", "is_correct": True}],
     }
 ]
 
