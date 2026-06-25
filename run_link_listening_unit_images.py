@@ -6,10 +6,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"     # or your EB URL
-DATABASE = "spanish"
-DRY_RUN = True
+DATABASE = "italian"
+DRY_RUN = False
 
-UNITS = [1, 2]                  # unit numbers to process
+UNITS = [3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30]                  # unit numbers to process
 
 
 def run():

@@ -6076,4 +6076,161 @@ def link_listening_unit_images(body: LinkListeningUnitImagesRequest):
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
+# =============================================================================
+#  /link-reading-lesson-images
+#
+#  For new READING lessons that exist in Lesson but have no image wired up yet:
+#  create one Image row for the lesson and one LessonImages row pointing at it.
+#
+#  Per lesson (targeted by lesson_id OR title, each with its own image_url):
+#    1. resolve lesson; must be type='reading'            -> else warn + skip
+#    2. if it already has a LessonImages row              -> warn + skip (safe re-runs)
+#    3. find first question (lowest sequence_id)          -> none? warn + skip
+#    4. INSERT Image (lesson_id, question_id, sequence_id, image_url, metadata) -> new image_id
+#    5. INSERT LessonImages (image_id, lesson_id)
+#
+#  Streams NDJSON. dry_run=True (default): reports the plan, writes nothing, rolls back.
+#  Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse / json.
+# =============================================================================
+
+
+class ReadingImageTarget(BaseModel):
+    lesson_id: int | None = None
+    title: str | None = None
+    image_url: str
+
+
+class LinkReadingLessonImagesRequest(BaseModel):
+    db: DBConfig
+    lessons: list[ReadingImageTarget]      # each: {lesson_id | title, image_url}
+    dry_run: bool = True
+
+
+@app.post("/link-reading-lesson-images")
+def link_reading_lesson_images(body: LinkReadingLessonImagesRequest):
+
+    def stream():
+        if not body.lessons:
+            yield _emit("error", message="Provide at least one lesson in 'lessons'")
+            return
+
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        yield _emit("start", action="link-reading-lesson-images",
+                    database=body.db.database, lessons=len(body.lessons), dry_run=body.dry_run)
+
+        grand = {"created": 0, "skipped": 0, "errors": 0}
+
+        try:
+            for tgt in body.lessons:
+                if not tgt.lesson_id and not tgt.title:
+                    grand["errors"] += 1
+                    yield _emit("lesson_error", error="target needs lesson_id or title")
+                    continue
+                if not tgt.image_url or not tgt.image_url.strip():
+                    grand["errors"] += 1
+                    yield _emit("lesson_error", lesson_id=tgt.lesson_id, title=tgt.title,
+                                error="image_url is empty")
+                    continue
+
+                # 1) resolve lesson
+                with conn.cursor() as cur:
+                    if tgt.lesson_id:
+                        cur.execute("SELECT lesson_id, title, type FROM Lesson WHERE lesson_id = %s",
+                                    (tgt.lesson_id,))
+                    else:
+                        cur.execute("SELECT lesson_id, title, type FROM Lesson WHERE title = %s",
+                                    (tgt.title,))
+                    lrow = cur.fetchone()
+
+                if not lrow:
+                    grand["skipped"] += 1
+                    yield _emit("lesson_skipped", lesson_id=tgt.lesson_id, title=tgt.title,
+                                reason="lesson not found")
+                    continue
+                if lrow["type"] != "reading":
+                    grand["skipped"] += 1
+                    yield _emit("lesson_skipped", lesson_id=lrow["lesson_id"], title=lrow["title"],
+                                reason=f"lesson type is '{lrow['type']}', expected reading")
+                    continue
+
+                lid = lrow["lesson_id"]
+
+                # 2) already linked?
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM LessonImages WHERE lesson_id = %s LIMIT 1", (lid,))
+                    if cur.fetchone():
+                        grand["skipped"] += 1
+                        yield _emit("lesson_skipped", lesson_id=lid, title=lrow["title"],
+                                    reason="already has a LessonImages row")
+                        continue
+
+                # 3) first question (lowest sequence_id)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT question_id, sequence_id FROM Question WHERE lesson_id = %s "
+                        "ORDER BY sequence_id ASC, question_id ASC LIMIT 1",
+                        (lid,),
+                    )
+                    qrow = cur.fetchone()
+                if not qrow:
+                    grand["skipped"] += 1
+                    yield _emit("lesson_skipped", lesson_id=lid, title=lrow["title"],
+                                reason="lesson has no questions")
+                    continue
+
+                first_qid = qrow["question_id"]
+                first_seq = qrow["sequence_id"]
+
+                yield _emit("lesson_plan", lesson_id=lid, title=lrow["title"],
+                            first_question_id=first_qid, sequence_id=first_seq,
+                            image_url=tgt.image_url)
+
+                if not body.dry_run:
+                    meta = json.dumps({"source": "reading_lesson_image", "lesson_id": lid},
+                                      ensure_ascii=False)
+                    with conn.cursor() as cur:
+                        # 4) Image row for the lesson
+                        cur.execute(
+                            "INSERT INTO Image (lesson_id, question_id, sequence_id, image_url, image_metadata) "
+                            "VALUES (%s, %s, %s, %s, CAST(%s AS JSON))",
+                            (lid, first_qid, first_seq, tgt.image_url, meta),
+                        )
+                        new_image_id = cur.lastrowid
+
+                        # 5) LessonImages row linking image -> lesson
+                        cur.execute(
+                            "INSERT INTO LessonImages (image_id, lesson_id) VALUES (%s, %s)",
+                            (new_image_id, lid),
+                        )
+                    conn.commit()
+                else:
+                    new_image_id = None
+
+                grand["created"] += 1
+                yield _emit("lesson_created", lesson_id=lid, title=lrow["title"],
+                            image_id=new_image_id, question_id=first_qid,
+                            sequence_id=first_seq, image_url=tgt.image_url)
+                logger.info("link-reading-lesson-images | lesson %d -> image %s",
+                            lid, new_image_id)
+
+            if body.dry_run:
+                conn.rollback()
+
+            yield _emit("summary", dry_run=body.dry_run, totals=grand)
+            logger.info("link-reading-lesson-images done | dry_run=%s totals=%s", body.dry_run, grand)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("link-reading-lesson-images failed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
 lambda_handler = Mangum(app)
