@@ -6320,15 +6320,16 @@ def link_reading_lesson_images(body: LinkReadingLessonImagesRequest):
 # =============================================================================
 #  /swap-vocab-question-answer
 #
-#  For a vocabulary lesson (by title), swap question_text <-> answer_text for every
-#  question: the old question_text becomes the answer, the old answer_text becomes
+#  For one or more vocabulary lessons (by title), swap question_text <-> answer_text
+#  for every question: old question_text becomes the answer, old answer_text becomes
 #  the question.
 #
 #  Safety:
-#    - vocabulary lessons only (refuses otherwise)
+#    - vocabulary lessons only (skips + reports any non-vocab / missing title)
 #    - skips any question with no real (non-blank) answer to swap with (would blank it)
 #    - flags questions with >1 answer row (ambiguous) and skips them
 #    - dry_run=True (default): streams every old->new swap, writes nothing, rolls back
+#    - commits per lesson on a live run
 #
 #  Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse.
 # =============================================================================
@@ -6336,7 +6337,7 @@ def link_reading_lesson_images(body: LinkReadingLessonImagesRequest):
 
 class SwapVocabQARequest(BaseModel):
     db: DBConfig
-    title: str
+    titles: list[str]
     dry_run: bool = True
 
 
@@ -6344,6 +6345,10 @@ class SwapVocabQARequest(BaseModel):
 def swap_vocab_question_answer(body: SwapVocabQARequest):
 
     def stream():
+        if not body.titles:
+            yield _emit("error", message="Provide at least one title in 'titles'")
+            return
+
         try:
             conn = connect_to_db(body.db)
         except Exception as e:
@@ -6351,85 +6356,97 @@ def swap_vocab_question_answer(body: SwapVocabQARequest):
             return
 
         yield _emit("start", action="swap-vocab-question-answer",
-                    title=body.title, dry_run=body.dry_run)
+                    titles=body.titles, dry_run=body.dry_run)
+
+        grand = {"lessons": 0, "swapped": 0,
+                 "skipped_no_answer": 0, "skipped_multi_answer": 0, "skipped_lessons": 0}
 
         try:
-            # resolve lesson, must be vocabulary
-            with conn.cursor() as cur:
-                cur.execute("SELECT lesson_id, type FROM Lesson WHERE title = %s", (body.title,))
-                lrow = cur.fetchone()
-            if not lrow:
-                conn.close(); yield _emit("error", message="lesson not found"); return
-            if lrow["type"] != "vocabulary":
-                conn.close()
-                yield _emit("error", message=f"lesson type is '{lrow['type']}', expected vocabulary")
-                return
-            lid = lrow["lesson_id"]
+            for title in body.titles:
+                # resolve lesson, must be vocabulary
+                with conn.cursor() as cur:
+                    cur.execute("SELECT lesson_id, type FROM Lesson WHERE title = %s", (title,))
+                    lrow = cur.fetchone()
+                if not lrow:
+                    grand["skipped_lessons"] += 1
+                    yield _emit("lesson_skipped", title=title, reason="lesson not found")
+                    continue
+                if lrow["type"] != "vocabulary":
+                    grand["skipped_lessons"] += 1
+                    yield _emit("lesson_skipped", title=title,
+                                reason=f"lesson type is '{lrow['type']}', expected vocabulary")
+                    continue
+                lid = lrow["lesson_id"]
 
-            # pull questions + their answer rows
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT question_id, sequence_id, question_text FROM Question "
-                    "WHERE lesson_id = %s ORDER BY sequence_id, question_id",
-                    (lid,),
-                )
-                questions = cur.fetchall()
-
-            yield _emit("resolved", lesson_id=lid, questions=len(questions))
-
-            totals = {"swapped": 0, "skipped_no_answer": 0, "skipped_multi_answer": 0}
-
-            for q in questions:
-                qid = q["question_id"]
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT answer_id, answer_text FROM Answer WHERE question_id = %s "
-                        "ORDER BY answer_id ASC",
-                        (qid,),
+                        "SELECT question_id, sequence_id, question_text FROM Question "
+                        "WHERE lesson_id = %s ORDER BY sequence_id, question_id",
+                        (lid,),
                     )
-                    answers = cur.fetchall()
+                    questions = cur.fetchall()
 
-                # ambiguous: more than one answer row
-                if len(answers) > 1:
-                    totals["skipped_multi_answer"] += 1
-                    yield _emit("skipped", question_id=qid, sequence_id=q["sequence_id"],
-                                reason="multiple answer rows (ambiguous)", answer_rows=len(answers))
-                    continue
+                yield _emit("lesson_start", title=title, lesson_id=lid, questions=len(questions))
 
-                ans = answers[0] if answers else None
-                ans_text = (ans["answer_text"] if ans else "") or ""
-                q_text = q["question_text"] or ""
+                l_tot = {"swapped": 0, "skipped_no_answer": 0, "skipped_multi_answer": 0}
 
-                # no real answer to swap with -> skip (swapping would blank the question)
-                if ans is None or ans_text.strip() == "":
-                    totals["skipped_no_answer"] += 1
-                    yield _emit("skipped", question_id=qid, sequence_id=q["sequence_id"],
-                                reason="no non-blank answer to swap with")
-                    continue
-
-                new_question_text = ans_text
-                new_answer_text = q_text
-
-                yield _emit("swap", question_id=qid, sequence_id=q["sequence_id"],
-                            old_question=q_text, old_answer=ans_text,
-                            new_question=new_question_text, new_answer=new_answer_text)
-
-                if not body.dry_run:
+                for q in questions:
+                    qid = q["question_id"]
                     with conn.cursor() as cur:
-                        cur.execute("UPDATE Question SET question_text = %s WHERE question_id = %s",
-                                    (new_question_text, qid))
-                        cur.execute("UPDATE Answer SET answer_text = %s WHERE answer_id = %s",
-                                    (new_answer_text, ans["answer_id"]))
-                totals["swapped"] += 1
+                        cur.execute(
+                            "SELECT answer_id, answer_text FROM Answer WHERE question_id = %s "
+                            "ORDER BY answer_id ASC",
+                            (qid,),
+                        )
+                        answers = cur.fetchall()
 
-            if body.dry_run:
-                conn.rollback()
-            else:
-                conn.commit()
+                    if len(answers) > 1:
+                        l_tot["skipped_multi_answer"] += 1
+                        yield _emit("skipped", title=title, question_id=qid,
+                                    sequence_id=q["sequence_id"],
+                                    reason="multiple answer rows (ambiguous)", answer_rows=len(answers))
+                        continue
 
-            yield _emit("summary", dry_run=body.dry_run, lesson_id=lid,
-                        title=body.title, totals=totals)
-            logger.info("swap-vocab-qa | lesson=%s dry_run=%s %s", lid, body.dry_run, totals)
+                    ans = answers[0] if answers else None
+                    ans_text = (ans["answer_text"] if ans else "") or ""
+                    q_text = q["question_text"] or ""
+
+                    if ans is None or ans_text.strip() == "":
+                        l_tot["skipped_no_answer"] += 1
+                        yield _emit("skipped", title=title, question_id=qid,
+                                    sequence_id=q["sequence_id"],
+                                    reason="no non-blank answer to swap with")
+                        continue
+
+                    new_question_text = ans_text
+                    new_answer_text = q_text
+
+                    yield _emit("swap", title=title, question_id=qid, sequence_id=q["sequence_id"],
+                                old_question=q_text, old_answer=ans_text,
+                                new_question=new_question_text, new_answer=new_answer_text)
+
+                    if not body.dry_run:
+                        with conn.cursor() as cur:
+                            cur.execute("UPDATE Question SET question_text = %s WHERE question_id = %s",
+                                        (new_question_text, qid))
+                            cur.execute("UPDATE Answer SET answer_text = %s WHERE answer_id = %s",
+                                        (new_answer_text, ans["answer_id"]))
+                    l_tot["swapped"] += 1
+
+                if body.dry_run:
+                    conn.rollback()
+                else:
+                    conn.commit()
+
+                grand["lessons"] += 1
+                grand["swapped"] += l_tot["swapped"]
+                grand["skipped_no_answer"] += l_tot["skipped_no_answer"]
+                grand["skipped_multi_answer"] += l_tot["skipped_multi_answer"]
+
+                yield _emit("lesson_done", title=title, lesson_id=lid, totals=l_tot)
+
+            yield _emit("summary", dry_run=body.dry_run, totals=grand)
+            logger.info("swap-vocab-qa | dry_run=%s %s", body.dry_run, grand)
 
         except Exception as e:
             conn.rollback()
