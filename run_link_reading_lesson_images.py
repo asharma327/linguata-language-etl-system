@@ -5,14 +5,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE = "http://localhost:8000"     # or your EB URL
+BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"     # or your EB URL
 DATABASE = "german"
-DRY_RUN = True
+DRY_RUN = False
 
 # Each lesson: target by lesson_id OR title, plus its image_url.
 LESSONS = [
-    {"title": "unit2_situation_1", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit2_greetings_travel_conversation.png"},
-    {"title": "unit2_situation_2", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit2_greetings_travel_conversation.png"},
+    {"title": "unit5_conversation_practice1", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit5_pronunciation_conversation_language.png"},
+    {"title": "unit5_conversation_practice2", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit5_pronunciation_conversation_language.png"},
+    {"title": "unit5_conversation_practice3", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit5_pronunciation_conversation_language.png"},
+    {"title": "unit5_conversation_practice4", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit5_pronunciation_conversation_language.png"},
+    {"title": "unit4_situation_1", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit4_visa_travel_introduction.png"},
+    {"title": "unit4_situation_2", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit4_visa_travel_introduction.png"},
     # {"lesson_id": 4123, "image_url": "https://..."},
 ]
 

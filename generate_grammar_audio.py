@@ -24,6 +24,9 @@ if __name__ == "__main__":
     # OPTION 1: exact lesson titles (one or many)
     # ----------------------------------------------------------
     TITLES = [
+        "unit6_language_usage",
+        # "unit13_language_usage",
+        # "unit20_language_usage",
         # "unit1_grammar_do_the_japanese_understand_english",
         # "unit1_grammar_forms_of_address",
         # "unit1_grammar_greetings",

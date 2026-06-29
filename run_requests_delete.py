@@ -8,9 +8,9 @@ load_dotenv()
 BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"
 
 # --- choose ONE action ---
-ACTION = "delete-lessons"          # "delete-questions" or "delete-lessons"
+ACTION = "delete-questions"          # "delete-questions" or "delete-lessons"
 
-DATABASE = "italian"
+DATABASE = "german"
 DRY_RUN = False                    # True = preview + rollback; False = actually delete
 KEEP_USER_HISTORY = False          # True = don't delete userResponses / user_attempts rows
 
@@ -18,9 +18,9 @@ TITLES = [
     # "unit4_situations",
     
 ]
-LESSON_IDS = [3939]          # used when ACTION == "delete-lessons"  
+LESSON_IDS = None          # used when ACTION == "delete-lessons"  
 
-QUESTION_IDS = None        # used when ACTION == "delete-questions"
+QUESTION_IDS = [45014, 55970]        # used when ACTION == "delete-questions"
 
 
 def run():

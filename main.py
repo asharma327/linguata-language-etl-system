@@ -159,16 +159,6 @@ class GenerateUnitImagesRequest(BaseModel):
     temperature: float = 0.4
 
 
-class LinkGrammarVideosRequest(BaseModel):
-    db: DBConfig
-    s3_bucket: str
-    s3_prefix: str                                    # prefix under which .mp4 files live
-    aws_region: str = "us-east-1"
-    aws_access_key_id: str | None = None
-    aws_secret_access_key: str | None = None
-    force: bool = False                               # re-insert even if VideoLesson row already exists
-
-
 class IngestUnitImagesRequest(BaseModel):
     db: DBConfig
     s3_bucket: str
@@ -2705,104 +2695,197 @@ def migrate_audio_table(body: DBConfig):
     })
 
 
+# =============================================================================
+#  /link-grammar-videos  (streaming, title-scoped, true replace)
+#
+#  Scans an S3 prefix for .mp4 files, extracts lesson_id from each filename
+#  (first underscore-separated segment, e.g. '3608' from
+#  '3608_..._unit12_grammar_generated.mp4'), and links each to its grammar lesson.
+#
+#  Scope:
+#    titles = None        -> process every .mp4 found in the prefix
+#    titles = [...]        -> resolve to lesson_ids; only process files for those lessons,
+#                            and WARN for any requested title whose .mp4 isn't in S3
+#
+#  force:
+#    False -> link only lessons with NO video yet; skip ones already linked
+#    True  -> REPLACE: delete the lesson's existing VideoLesson + orphaned Video,
+#             then insert the regenerated video (use after QA regenerates)
+#
+#  Streams NDJSON. Reuses connect_to_db / DBConfig / logger / _emit /
+#  StreamingResponse / _make_s3_client / Path.
+# =============================================================================
+
+
+class LinkGrammarVideosRequest(BaseModel):
+    db: DBConfig
+    s3_bucket: str
+    s3_prefix: str
+    titles: list[str] | None = None                   # restrict to these grammar lessons
+    aws_region: str = "us-east-1"
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    force: bool = False                               # True = replace existing video for the lesson
+
+
 @app.post("/link-grammar-videos")
 def link_grammar_videos(body: LinkGrammarVideosRequest):
-    """
-    Scans an S3 prefix for .mp4 files, extracts the lesson_id from each filename
-    (the first underscore-separated segment, e.g. '3251' from
-    '3251_3875_unit10_direct_clitic_pronouns_generated.mp4'), inserts a row into the
-    Video table (url = public S3 URL) and a corresponding row into VideoLesson.
 
-    Skips a file if a VideoLesson row for that lesson_id already exists, unless
-    force=True.
-    """
-    try:
-        conn = connect_to_db(body.db)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not connect to database: {e}")
+    def stream():
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
 
-    s3 = _make_s3_client(body.aws_region, body.aws_access_key_id, body.aws_secret_access_key)
+        s3 = _make_s3_client(body.aws_region, body.aws_access_key_id, body.aws_secret_access_key)
 
-    # List all .mp4 keys under the prefix
-    prefix = body.s3_prefix.rstrip("/") + "/"
-    video_keys: list[str] = []
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=body.s3_bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.lower().endswith(".mp4"):
-                video_keys.append(key)
-    video_keys.sort()
+        yield _emit("start", action="link-grammar-videos", database=body.db.database,
+                    s3_prefix=body.s3_prefix, force=body.force,
+                    titles=body.titles or None)
 
-    inserted = []
-    skipped = []
-    errors = []
-
-    try:
-        for key in video_keys:
-            filename = Path(key).name
-            # Extract lesson_id from the first segment of the filename
-            first_segment = filename.split("_")[0]
-            if not first_segment.isdigit():
-                errors.append({"key": key, "error": f"Cannot parse lesson_id from filename '{filename}'"})
-                continue
-            lesson_id = int(first_segment)
-
-            try:
+        # --- resolve title scope -> {lesson_id: title} ---
+        wanted_ids: set | None = None
+        title_by_id: dict = {}
+        try:
+            if body.titles:
                 with conn.cursor() as cur:
-                    # Verify lesson exists and is a grammar lesson
+                    ph = ",".join(["%s"] * len(body.titles))
                     cur.execute(
-                        "SELECT lesson_id FROM Lesson WHERE lesson_id = %s AND type = 'grammar'",
-                        (lesson_id,),
+                        f"SELECT lesson_id, title FROM Lesson "
+                        f"WHERE type='grammar' AND title IN ({ph})",
+                        tuple(body.titles),
                     )
-                    if not cur.fetchone():
-                        errors.append({"key": key, "error": f"No grammar lesson found with lesson_id={lesson_id}"})
-                        continue
+                    rows = cur.fetchall()
+                title_by_id = {r["lesson_id"]: r["title"] for r in rows}
+                wanted_ids = set(title_by_id.keys())
+                found_titles = set(title_by_id.values())
+                missing = [t for t in body.titles if t not in found_titles]
+                if missing:
+                    yield _emit("warning", message="titles not found as grammar lessons", titles=missing)
+                if not wanted_ids:
+                    conn.close()
+                    yield _emit("error", message="none of the requested titles resolved to grammar lessons")
+                    return
+        except Exception as e:
+            conn.close()
+            yield _emit("error", message=f"Failed to resolve titles: {e}")
+            return
 
-                    # Check for existing VideoLesson row
-                    if not body.force:
+        # --- list .mp4 keys under the prefix ---
+        prefix = body.s3_prefix.rstrip("/") + "/"
+        video_keys: list[str] = []
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=body.s3_bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if key.lower().endswith(".mp4"):
+                        video_keys.append(key)
+            video_keys.sort()
+        except Exception as e:
+            conn.close()
+            yield _emit("error", message=f"Failed to list S3 objects: {e}")
+            return
+
+        yield _emit("found", total_mp4=len(video_keys))
+
+        totals = {"inserted": 0, "replaced": 0, "skipped": 0, "errors": 0}
+        seen_lesson_ids: set = set()
+
+        try:
+            for key in video_keys:
+                filename = Path(key).name
+                first_segment = filename.split("_")[0]
+                if not first_segment.isdigit():
+                    totals["errors"] += 1
+                    yield _emit("file_error", key=key,
+                                error=f"cannot parse lesson_id from filename '{filename}'")
+                    continue
+                lesson_id = int(first_segment)
+
+                # title scope filter
+                if wanted_ids is not None and lesson_id not in wanted_ids:
+                    yield _emit("file_skipped", key=key, lesson_id=lesson_id,
+                                reason="not in requested titles")
+                    continue
+
+                try:
+                    with conn.cursor() as cur:
                         cur.execute(
-                            "SELECT video_id FROM VideoLesson WHERE lesson_id = %s",
+                            "SELECT lesson_id, title FROM Lesson WHERE lesson_id = %s AND type = 'grammar'",
                             (lesson_id,),
                         )
-                        if cur.fetchone():
-                            skipped.append({"key": key, "lesson_id": lesson_id, "reason": "VideoLesson already exists"})
+                        lrow = cur.fetchone()
+                        if not lrow:
+                            totals["errors"] += 1
+                            yield _emit("file_error", key=key,
+                                        error=f"no grammar lesson with lesson_id={lesson_id}")
                             continue
+                        title = lrow["title"]
 
-                    video_url = f"https://{body.s3_bucket}.s3.{body.aws_region}.amazonaws.com/{key}"
+                        cur.execute("SELECT video_id FROM VideoLesson WHERE lesson_id = %s", (lesson_id,))
+                        existing_video_ids = [r["video_id"] for r in cur.fetchall()]
 
-                    # Insert into Video table and retrieve the auto-generated video_id
-                    cur.execute("INSERT INTO Video (url) VALUES (%s)", (video_url,))
-                    video_id = cur.lastrowid
+                        was_replace = False
+                        if existing_video_ids:
+                            if not body.force:
+                                totals["skipped"] += 1
+                                yield _emit("skipped", key=key, lesson_id=lesson_id, title=title,
+                                            reason="already linked (use force=True to replace)")
+                                continue
+                            cur.execute("DELETE FROM VideoLesson WHERE lesson_id = %s", (lesson_id,))
+                            vfmt = ",".join(["%s"] * len(existing_video_ids))
+                            cur.execute(
+                                f"DELETE v FROM Video v "
+                                f"LEFT JOIN VideoLesson vl ON vl.video_id = v.video_id "
+                                f"WHERE v.video_id IN ({vfmt}) AND vl.video_id IS NULL",
+                                tuple(existing_video_ids),
+                            )
+                            was_replace = True
 
-                    # Insert into VideoLesson table
-                    cur.execute(
-                        "INSERT INTO VideoLesson (video_id, lesson_id) VALUES (%s, %s)",
-                        (video_id, lesson_id),
-                    )
+                        video_url = f"https://{body.s3_bucket}.s3.{body.aws_region}.amazonaws.com/{key}"
+                        cur.execute("INSERT INTO Video (url) VALUES (%s)", (video_url,))
+                        video_id = cur.lastrowid
+                        cur.execute(
+                            "INSERT INTO VideoLesson (video_id, lesson_id) VALUES (%s, %s)",
+                            (video_id, lesson_id),
+                        )
 
-                conn.commit()
-                inserted.append({"key": key, "lesson_id": lesson_id, "video_id": video_id, "url": video_url})
+                    conn.commit()
+                    seen_lesson_ids.add(lesson_id)
+                    if was_replace:
+                        totals["replaced"] += 1
+                        yield _emit("replaced", key=key, lesson_id=lesson_id, title=title,
+                                    video_id=video_id, url=video_url, removed_video_ids=existing_video_ids)
+                    else:
+                        totals["inserted"] += 1
+                        yield _emit("inserted", key=key, lesson_id=lesson_id, title=title,
+                                    video_id=video_id, url=video_url)
 
-            except Exception as e:
-                conn.rollback()
-                errors.append({"key": key, "error": str(e)})
+                except Exception as e:
+                    conn.rollback()
+                    totals["errors"] += 1
+                    yield _emit("file_error", key=key, lesson_id=lesson_id, error=str(e))
 
-    finally:
-        conn.close()
+            # warn about requested titles that never matched a file
+            if wanted_ids is not None:
+                no_file = [title_by_id[i] for i in wanted_ids if i not in seen_lesson_ids]
+                if no_file:
+                    yield _emit("warning", message="requested titles had no matching .mp4 in S3",
+                                titles=sorted(no_file))
 
-    return JSONResponse(content={
-        "status": "ok",
-        "inserted": inserted,
-        "skipped": skipped,
-        "errors": errors,
-        "summary": {
-            "total_files": len(video_keys),
-            "inserted": len(inserted),
-            "skipped": len(skipped),
-            "errors": len(errors),
-        },
-    })
+            yield _emit("summary", totals=totals)
+            logger.info("link-grammar-videos done | %s", totals)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("link-grammar-videos crashed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e))
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 @app.post("/ingest-unit-images")
@@ -6227,6 +6310,130 @@ def link_reading_lesson_images(body: LinkReadingLessonImagesRequest):
         except Exception as e:
             conn.rollback()
             logger.error("link-reading-lesson-images failed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+# =============================================================================
+#  /swap-vocab-question-answer
+#
+#  For a vocabulary lesson (by title), swap question_text <-> answer_text for every
+#  question: the old question_text becomes the answer, the old answer_text becomes
+#  the question.
+#
+#  Safety:
+#    - vocabulary lessons only (refuses otherwise)
+#    - skips any question with no real (non-blank) answer to swap with (would blank it)
+#    - flags questions with >1 answer row (ambiguous) and skips them
+#    - dry_run=True (default): streams every old->new swap, writes nothing, rolls back
+#
+#  Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse.
+# =============================================================================
+
+
+class SwapVocabQARequest(BaseModel):
+    db: DBConfig
+    title: str
+    dry_run: bool = True
+
+
+@app.post("/swap-vocab-question-answer")
+def swap_vocab_question_answer(body: SwapVocabQARequest):
+
+    def stream():
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        yield _emit("start", action="swap-vocab-question-answer",
+                    title=body.title, dry_run=body.dry_run)
+
+        try:
+            # resolve lesson, must be vocabulary
+            with conn.cursor() as cur:
+                cur.execute("SELECT lesson_id, type FROM Lesson WHERE title = %s", (body.title,))
+                lrow = cur.fetchone()
+            if not lrow:
+                conn.close(); yield _emit("error", message="lesson not found"); return
+            if lrow["type"] != "vocabulary":
+                conn.close()
+                yield _emit("error", message=f"lesson type is '{lrow['type']}', expected vocabulary")
+                return
+            lid = lrow["lesson_id"]
+
+            # pull questions + their answer rows
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT question_id, sequence_id, question_text FROM Question "
+                    "WHERE lesson_id = %s ORDER BY sequence_id, question_id",
+                    (lid,),
+                )
+                questions = cur.fetchall()
+
+            yield _emit("resolved", lesson_id=lid, questions=len(questions))
+
+            totals = {"swapped": 0, "skipped_no_answer": 0, "skipped_multi_answer": 0}
+
+            for q in questions:
+                qid = q["question_id"]
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT answer_id, answer_text FROM Answer WHERE question_id = %s "
+                        "ORDER BY answer_id ASC",
+                        (qid,),
+                    )
+                    answers = cur.fetchall()
+
+                # ambiguous: more than one answer row
+                if len(answers) > 1:
+                    totals["skipped_multi_answer"] += 1
+                    yield _emit("skipped", question_id=qid, sequence_id=q["sequence_id"],
+                                reason="multiple answer rows (ambiguous)", answer_rows=len(answers))
+                    continue
+
+                ans = answers[0] if answers else None
+                ans_text = (ans["answer_text"] if ans else "") or ""
+                q_text = q["question_text"] or ""
+
+                # no real answer to swap with -> skip (swapping would blank the question)
+                if ans is None or ans_text.strip() == "":
+                    totals["skipped_no_answer"] += 1
+                    yield _emit("skipped", question_id=qid, sequence_id=q["sequence_id"],
+                                reason="no non-blank answer to swap with")
+                    continue
+
+                new_question_text = ans_text
+                new_answer_text = q_text
+
+                yield _emit("swap", question_id=qid, sequence_id=q["sequence_id"],
+                            old_question=q_text, old_answer=ans_text,
+                            new_question=new_question_text, new_answer=new_answer_text)
+
+                if not body.dry_run:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE Question SET question_text = %s WHERE question_id = %s",
+                                    (new_question_text, qid))
+                        cur.execute("UPDATE Answer SET answer_text = %s WHERE answer_id = %s",
+                                    (new_answer_text, ans["answer_id"]))
+                totals["swapped"] += 1
+
+            if body.dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+
+            yield _emit("summary", dry_run=body.dry_run, lesson_id=lid,
+                        title=body.title, totals=totals)
+            logger.info("swap-vocab-qa | lesson=%s dry_run=%s %s", lid, body.dry_run, totals)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("swap-vocab-qa failed: %s\n%s", e, traceback.format_exc())
             yield _emit("error", message=str(e), rolled_back=True)
         finally:
             conn.close()
