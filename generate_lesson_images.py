@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-language = "german"  
+language = "extractiondb"  
 
 if __name__ == "__main__":
     DB = {
@@ -19,7 +19,15 @@ if __name__ == "__main__":
 
     # Exact lesson titles (one or many). For a single lesson, use a one-item list.
     TITLES = [
-        "unit24_finder_list",
+        "unit16_vocab_exercise_a3", 
+        "unit16_vocab_exercise_a4", 
+        "unit16_vocab_exercise_a6",
+        "unit13_vocabulary_unrecorded",
+        "unit14_vocab_exercise_a5",
+        "unit15_useful_words",
+        "unit16_vocab_exercise_a2",
+        "unit16_vocab_exercise_a5",
+        "unit18_translation_exercise_15",
     ]
 
     # NOTE on UNITS: matching is a PREFIX match on title (unit{N}%), so UNITS=[2]
@@ -42,7 +50,7 @@ if __name__ == "__main__":
     AWS_ACCESS_KEY_ID = os.environ["AWS_ACCESS_KEY_ID"]
     AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
     S3_BUCKET = "content-media-generation"
-    S3_PREFIX = f"{language}/images"
+    S3_PREFIX = "french"   #for languages other than french, it is --> f"{language}/images"
     AWS_REGION = "us-east-1"
 
     # ----------------------

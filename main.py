@@ -1084,7 +1084,7 @@ def get_image_settings(database_name: str):
         "hindi":    {"additional_prompt": "\nWhen appropriate, use objects, environments, clothing, and daily-life settings commonly seen in India.\nAvoid stereotypes.\n"},
         "japanese": {"additional_prompt": "\nWhen appropriate, use objects, environments, and daily-life settings commonly seen in Japan.\nAvoid stereotypes.\n"},
         "german":   {"additional_prompt": "\nWhen appropriate, use objects and environments commonly seen in Germany.\nAvoid stereotypes.\n"},
-        "french":   {"additional_prompt": "\nWhen appropriate, use objects and environments commonly seen in France.\nAvoid stereotypes.\n"},
+        "extractiondb":   {"additional_prompt": "\nWhen appropriate, use objects and environments commonly seen in France.\nAvoid stereotypes.\n"},
         "italian":  {"additional_prompt": "\nWhen appropriate, use objects and environments commonly seen in Italy.\nAvoid stereotypes.\n"},
         "spanish":  {"additional_prompt": "\nUse culturally neutral imagery unless regional context is important.\n"},
         "chinese":  {"additional_prompt": "\nWhen appropriate, use objects, environments, and daily-life settings commonly seen in China.\nAvoid stereotypes.\n"},

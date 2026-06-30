@@ -19,20 +19,6 @@ if __name__ == "__main__":
     # Lessons to process. One or many — for a single lesson use a one-item list.
     # Set TITLES = None to scan the whole database.
     TITLES = [
-        "unit13_vocabulary_unrecorded", 
-        "unit14_vocabulary_unrecorded", 
-        "unit15_vocabulary_unrecorded", 
-        "unit16_useful_words", 
-        "unit16_vocab_exercise_a3", 
-        "unit16_vocab_exercise_a4", 
-        "unit16_vocab_exercise_a6",
-        "unit14_vocab_exercise_a5",
-        "unit15_useful_words",
-        "unit16_translation_exercise_c1",
-        "unit16_vocab_exercise_a2",
-        "unit16_vocab_exercise_a5",
-        "unit17_useful_words",
-        "unit18_translation_exercise_15",
     ]
     LIMIT = None  # limit number of questions to process (for testing); set to None for no limit
 
