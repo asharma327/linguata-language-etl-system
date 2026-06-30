@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-language = "german"
+language = "extractiondb"
 
 if __name__ == "__main__":
 
@@ -19,21 +19,33 @@ if __name__ == "__main__":
     # Lessons to process. One or many — for a single lesson use a one-item list.
     # Set TITLES = None to scan the whole database.
     TITLES = [
-        "unit9_translation_drill"
+        "unit13_vocabulary_unrecorded", 
+        "unit14_vocabulary_unrecorded", 
+        "unit15_vocabulary_unrecorded", 
+        "unit16_useful_words", 
+        "unit16_vocab_exercise_a3", 
+        "unit16_vocab_exercise_a4", 
+        "unit16_vocab_exercise_a6",
+        "unit14_vocab_exercise_a5",
+        "unit15_useful_words",
+        "unit16_translation_exercise_c1",
+        "unit16_vocab_exercise_a2",
+        "unit16_vocab_exercise_a5",
+        "unit17_useful_words",
+        "unit18_translation_exercise_15",
     ]
-
     LIMIT = None  # limit number of questions to process (for testing); set to None for no limit
 
     TTS_MODEL = "gpt-4o-mini-tts"
     SOURCE_LANGUAGE = "en"
-    TARGET_LANGUAGE = "de"
+    TARGET_LANGUAGE = "fr"
 
     OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
     AWS_ACCESS_KEY_ID = os.environ["AWS_ACCESS_KEY_ID"]
     AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
 
     S3_BUCKET = "content-media-generation"
-    S3_PREFIX = f"{language}/vocab_audio"
+    S3_PREFIX = "french/audio"                #for languages other than french, it is --> f"{language}/vocab_audio"
     AWS_REGION = "us-east-1"
 
     payload = {

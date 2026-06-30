@@ -1953,9 +1953,9 @@ def get_tts_settings(database_name: str):
                 """
                         },
 
-                        "japanese": {
-                            "voice": "nova",
-                            "instructions": """
+        "japanese": {
+            "voice": "nova",
+            "instructions": """
                 Speak as a native Japanese speaker from Japan.
 
                 This audio is for a language-learning application.
@@ -1982,9 +1982,9 @@ def get_tts_settings(database_name: str):
                 """
                         },
 
-                        "german": {
-                            "voice": "nova",
-                            "instructions": """
+       "german": {
+           "voice": "nova",
+           "instructions": """
                 Speak as a native German speaker from Germany.
 
                 This audio is for a language-learning application.
@@ -2011,9 +2011,9 @@ def get_tts_settings(database_name: str):
                 """
                         },
 
-                        "french": {
-                            "voice": "nova",
-                            "instructions": """
+        "extractiondb": {
+            "voice": "nova",
+            "instructions": """
                 Speak as a native French speaker from France.
 
                 This audio is for a language-learning application.
@@ -2040,9 +2040,9 @@ def get_tts_settings(database_name: str):
                 """
                         },
 
-                        "italian": {
-                            "voice": "nova",
-                            "instructions": """
+        "italian": {
+            "voice": "nova",
+            "instructions": """
                 Speak as a native Italian speaker from Italy.
 
                 This audio is for a language-learning application.
@@ -2069,9 +2069,9 @@ def get_tts_settings(database_name: str):
                 """
                         },
 
-                        "spanish": {
-                            "voice": "nova",
-                            "instructions": """
+        "spanish": {
+            "voice": "nova",
+            "instructions": """
                 Speak as a native Spanish speaker from Spain.
 
                 This audio is for a language-learning application.
@@ -2098,9 +2098,9 @@ def get_tts_settings(database_name: str):
                 """
                         },
 
-                        "chinese": {
-                            "voice": "nova",
-                            "instructions": """
+        "chinese": {
+            "voice": "nova",
+            "instructions": """
                 Speak as a native Chinese speaker from China.
 
                 This audio is for a language-learning application.
