@@ -5,13 +5,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"
+BASE = "http://localhost:8000"
 DATABASE = "extractiondb"
 DRY_RUN = False
 
-# One or many vocabulary lessons.
+# One or many vocabulary lessons to renumber.
 TITLES = [
-    "unit15_vocabulary_unrecorded",
+    
 ]
 
 
@@ -27,7 +27,7 @@ def run():
         "dry_run": DRY_RUN,
     }
 
-    with requests.post(f"{BASE}/swap-vocab-question-answer",
+    with requests.post(f"{BASE}/renumber-vocab-sequence",
                        json=payload, stream=True, timeout=3600) as resp:
         for raw in resp.iter_lines(decode_unicode=True):
             if not raw:
@@ -39,19 +39,16 @@ def run():
 
             e = ev.get("event")
             if e == "start":
-                print(f"START swap-vocab-question-answer | titles={ev['titles']} | dry_run={ev['dry_run']}")
+                print(f"START renumber-vocab-sequence | titles={ev['titles']} | dry_run={ev['dry_run']}")
             elif e == "lesson_start":
                 print(f"\n== {ev['title']} (lesson {ev['lesson_id']}) | {ev['questions']} questions")
-            elif e == "swap":
-                print(f"  q{ev['question_id']} (seq {ev['sequence_id']}):")
-                print(f"      Q: {ev['old_question']!r} -> {ev['new_question']!r}")
-                print(f"      A: {ev['old_answer']!r} -> {ev['new_answer']!r}")
-            elif e == "skipped":
-                print(f"  q{ev['question_id']} (seq {ev['sequence_id']}) SKIPPED: {ev['reason']}")
+            elif e == "renumber":
+                print(f"   q{ev['question_id']}: {ev['old']} -> {ev['new']}")
             elif e == "lesson_skipped":
                 print(f"  LESSON SKIPPED {ev['title']}: {ev['reason']}")
             elif e == "lesson_done":
-                print(f"  = {ev['title']}: {ev['totals']}")
+                print(f"   = {ev['title']}: {ev['renumbered']} renumbered, "
+                      f"{ev['unchanged']} unchanged (of {ev['total']})")
             elif e == "summary":
                 print("\n" + "=" * 55)
                 print(f"SUMMARY | dry_run={ev['dry_run']} | {ev['totals']}")

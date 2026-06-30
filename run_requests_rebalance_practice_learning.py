@@ -5,11 +5,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE = "http://127.0.0.1:8000"
-DATABASE = "spanish"
+BASE = "http://localhost:8000"
+DATABASE = "extractiondb"
 DRY_RUN = False
 
-LESSON_IDS = None        # None = all grammar lessons; or a list to stage a subset
+LESSON_IDS = [1674]        # None = all grammar lessons; or a list to stage a subset
 MODEL = "gpt-4o-mini"
 
 

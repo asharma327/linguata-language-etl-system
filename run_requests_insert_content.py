@@ -6,24 +6,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"
-DATABASE = "italian"
+DATABASE = "german"
 DRY_RUN = False    # True = preview + rollback; False = actually insert
 
 # Target the lesson by title (preferred) or lesson_id.
-TITLE = "unit11_model8"
+TITLE = "unit2_variation_drill"
 LESSON_ID = None
 
 # Put ONLY the new items here — not the whole lesson.
 # Vocabulary / writing / grammar question = single answer:
 QUESTIONS_AND_ANSWERS = [
-    {
-        "question_text": "Che giorno era ieri?",
-        "answers": [{"answer_text": "Ieri era domenica.", "is_correct": True}],
-    },
-    {
-        "question_text": "Che giorno sarà domani?",
-        "answers": [{"answer_text": "Domani sarà martedì.", "is_correct": True}],
-    }
+    # {
+    #     "question_text": "Vide",
+    #     "answers": [{"answer_text": "La valise vide est à moi", "is_correct": True}],
+    # },
+    # {
+    #     "question_text": "Il ne reste que onze jours de vacances.",
+    #     "answers": [{"answer_text": "There are only eleven days of vacation left.", "is_correct": True}],
+    # },
+    # {
+    #     "question_text": "Il ne reste que des places séparées.",
+    #     "answers": [{"answer_text": "Only separate seats are left.", "is_correct": True}],
+    # },
 ]
 
 # Reading / listening question = four options with one correct:
@@ -40,7 +44,11 @@ QUESTIONS_AND_ANSWERS = [
 # ]
 
 # Article (reading / grammar / speaking):
-ARTICLES = None
+ARTICLES = [
+#   {
+#     "text": "-C'est une très bonne idée. Il faudrait louer les places le plus tôt possible. Je pourrais peut-être le faire demain."
+#   }
+]
 # ARTICLES = [{"text": "SRA. ALLEN: ¿Cómo está usted?"}]
 
 

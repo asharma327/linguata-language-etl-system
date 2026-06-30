@@ -6457,4 +6457,345 @@ def swap_vocab_question_answer(body: SwapVocabQARequest):
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
+
+# =============================================================================
+#  /renumber-vocab-sequence
+#
+#  For one or more VOCABULARY lessons (by title), renumber every question's
+#  sequence_id to a clean 1..n — closing gaps and resolving duplicate sequence_ids
+#  left behind by QA edits/deletes.
+#
+#  Order: sequence_id ASC, then question_id ASC (stable tie-break for duplicates).
+#  Safe two-pass update (offset to a temporary high range, then set final 1..n) so
+#  it works even with duplicate sequence_ids or a unique index on (lesson_id, sequence_id).
+#
+#  Safety:
+#    - vocabulary lessons only (skips + reports non-vocab / missing titles)
+#    - dry_run=True (default): streams every old->new mapping, writes nothing, rolls back
+#    - commits per lesson on a live run
+#
+#  Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse.
+# =============================================================================
+
+
+class RenumberVocabSequenceRequest(BaseModel):
+    db: DBConfig
+    titles: list[str]
+    dry_run: bool = True
+
+
+# offset large enough to never collide with real 1..n values during pass 1
+_SEQ_TEMP_OFFSET = 1000000
+
+
+# =============================================================================
+#  /renumber-vocab-sequence
+#
+#  For one or more VOCABULARY lessons (by title), renumber every question's
+#  sequence_id to a clean 1..n — closing gaps and resolving duplicate sequence_ids
+#  left behind by QA edits/deletes.
+#
+#  Order: question_id ASC (creation order) -> first-created question becomes 1, etc.
+#  Safe two-pass update (offset to a temporary high range, then set final 1..n) so
+#  it works even with duplicate sequence_ids or a unique index on (lesson_id, sequence_id).
+#
+#  Safety:
+#    - vocabulary lessons only (skips + reports non-vocab / missing titles)
+#    - dry_run=True (default): streams every old->new mapping, writes nothing, rolls back
+#    - commits per lesson on a live run
+#
+#  Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse.
+# =============================================================================
+
+
+class RenumberVocabSequenceRequest(BaseModel):
+    db: DBConfig
+    titles: list[str]
+    dry_run: bool = True
+
+
+# offset large enough to never collide with real 1..n values during pass 1
+_SEQ_TEMP_OFFSET = 1000000
+
+
+@app.post("/renumber-vocab-sequence")
+def renumber_vocab_sequence(body: RenumberVocabSequenceRequest):
+
+    def stream():
+        if not body.titles:
+            yield _emit("error", message="Provide at least one title in 'titles'")
+            return
+
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        yield _emit("start", action="renumber-vocab-sequence",
+                    titles=body.titles, dry_run=body.dry_run)
+
+        grand = {"lessons": 0, "renumbered_questions": 0,
+                 "unchanged_questions": 0, "skipped_lessons": 0}
+
+        try:
+            for title in body.titles:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT lesson_id, type FROM Lesson WHERE title = %s", (title,))
+                    lrow = cur.fetchone()
+                if not lrow:
+                    grand["skipped_lessons"] += 1
+                    yield _emit("lesson_skipped", title=title, reason="lesson not found")
+                    continue
+                if lrow["type"] != "vocabulary":
+                    grand["skipped_lessons"] += 1
+                    yield _emit("lesson_skipped", title=title,
+                                reason=f"lesson type is '{lrow['type']}', expected vocabulary")
+                    continue
+                lid = lrow["lesson_id"]
+
+                # read questions in the target order
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT question_id, sequence_id FROM Question "
+                        "WHERE lesson_id = %s ORDER BY question_id ASC",
+                        (lid,),
+                    )
+                    questions = cur.fetchall()
+
+                yield _emit("lesson_start", title=title, lesson_id=lid, questions=len(questions))
+
+                # compute the new mapping (1..n)
+                mapping = []   # (question_id, old_seq, new_seq)
+                changed = 0
+                for new_seq, q in enumerate(questions, start=1):
+                    old_seq = q["sequence_id"]
+                    mapping.append((q["question_id"], old_seq, new_seq))
+                    if old_seq != new_seq:
+                        changed += 1
+                        yield _emit("renumber", title=title, question_id=q["question_id"],
+                                    old=old_seq, new=new_seq)
+
+                # apply with a safe two-pass update (only if there is something to do)
+                if not body.dry_run and changed > 0:
+                    with conn.cursor() as cur:
+                        # pass 1: move everyone to a temporary, collision-free range
+                        for qid, _old, new_seq in mapping:
+                            cur.execute(
+                                "UPDATE Question SET sequence_id = %s WHERE question_id = %s",
+                                (new_seq + _SEQ_TEMP_OFFSET, qid),
+                            )
+                        # pass 2: bring them down to the final 1..n
+                        for qid, _old, new_seq in mapping:
+                            cur.execute(
+                                "UPDATE Question SET sequence_id = %s WHERE question_id = %s",
+                                (new_seq, qid),
+                            )
+                    conn.commit()
+                elif body.dry_run:
+                    conn.rollback()
+                # changed == 0 -> nothing to write
+
+                grand["lessons"] += 1
+                grand["renumbered_questions"] += changed
+                grand["unchanged_questions"] += (len(questions) - changed)
+
+                yield _emit("lesson_done", title=title, lesson_id=lid,
+                            total=len(questions), renumbered=changed,
+                            unchanged=len(questions) - changed)
+
+            yield _emit("summary", dry_run=body.dry_run, totals=grand)
+            logger.info("renumber-vocab-sequence | dry_run=%s %s", body.dry_run, grand)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("renumber-vocab-sequence failed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+# =============================================================================
+#  /fill-vocab-answers
+#
+#  For one or more VOCABULARY lessons (by title), fill in MISSING answers by
+#  translating question_text -> English via OpenAI.
+#
+#  Per question:
+#    - real answer already present  -> left untouched
+#    - Answer row exists but blank   -> UPDATE its answer_text with the translation
+#    - no Answer row                 -> INSERT one (is_correct=1)
+#  Then: Question.has_answer = 1 and answer_category = 'practice'.
+#
+#  Safety:
+#    - vocabulary lessons only (skips + reports otherwise)
+#    - dry_run=True (default): makes the (cheap) OpenAI calls so you can review every
+#      proposed translation, but writes nothing and rolls back
+#    - commits per lesson on a live run
+#
+#  Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse / OpenAI / os.
+# =============================================================================
+
+
+class FillVocabAnswersRequest(BaseModel):
+    db: DBConfig
+    titles: list[str]
+    source_language: str = "German"        # human-readable; helps the model translate correctly
+    model: str = "gpt-4o-mini"
+    openai_api_key: str | None = None
+    dry_run: bool = True
+
+
+def _translate_to_english(client, model: str, text: str, source_language: str) -> str:
+    """Translate a single vocab word/phrase from source_language to English. Returns plain text."""
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": (
+                "You translate single vocabulary words or short phrases from a language-learning "
+                f"textbook. Translate the given {source_language} term into English. Reply with ONLY "
+                "the English translation — no quotes, no explanation, no trailing punctuation unless "
+                "it is part of the term."
+            )},
+            {"role": "user", "content": text},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+@app.post("/fill-vocab-answers")
+def fill_vocab_answers(body: FillVocabAnswersRequest):
+
+    def stream():
+        if not body.titles:
+            yield _emit("error", message="Provide at least one title in 'titles'")
+            return
+
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        client = OpenAI(api_key=body.openai_api_key or os.getenv("OPENAI_API_KEY"))
+
+        yield _emit("start", action="fill-vocab-answers", titles=body.titles,
+                    source_language=body.source_language, model=body.model, dry_run=body.dry_run)
+
+        grand = {"lessons": 0, "filled": 0, "inserted": 0, "updated": 0,
+                 "already_had_answer": 0, "skipped_lessons": 0, "errors": 0}
+
+        try:
+            for title in body.titles:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT lesson_id, type FROM Lesson WHERE title = %s", (title,))
+                    lrow = cur.fetchone()
+                if not lrow:
+                    grand["skipped_lessons"] += 1
+                    yield _emit("lesson_skipped", title=title, reason="lesson not found")
+                    continue
+                if lrow["type"] != "vocabulary":
+                    grand["skipped_lessons"] += 1
+                    yield _emit("lesson_skipped", title=title,
+                                reason=f"lesson type is '{lrow['type']}', expected vocabulary")
+                    continue
+                lid = lrow["lesson_id"]
+
+                # questions + their current (single) answer row, in order
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT q.question_id, q.sequence_id, q.question_text,
+                                  (SELECT a.answer_id   FROM Answer a WHERE a.question_id = q.question_id
+                                   ORDER BY a.answer_id ASC LIMIT 1) AS answer_id,
+                                  (SELECT a.answer_text FROM Answer a WHERE a.question_id = q.question_id
+                                   ORDER BY a.answer_id ASC LIMIT 1) AS answer_text
+                           FROM Question q WHERE q.lesson_id = %s
+                           ORDER BY q.sequence_id, q.question_id""",
+                        (lid,),
+                    )
+                    questions = cur.fetchall()
+
+                yield _emit("lesson_start", title=title, lesson_id=lid, questions=len(questions))
+
+                l_filled = l_ins = l_upd = l_had = 0
+
+                for q in questions:
+                    qid = q["question_id"]
+                    has_real_answer = (q["answer_text"] or "").strip() != ""
+                    if has_real_answer:
+                        l_had += 1
+                        continue  # leave existing answers alone
+
+                    qtext = (q["question_text"] or "").strip()
+                    if not qtext:
+                        grand["errors"] += 1
+                        yield _emit("skipped", title=title, question_id=qid,
+                                    sequence_id=q["sequence_id"], reason="question_text is blank")
+                        continue
+
+                    # translate (cheap; we do this even on dry_run so you can review)
+                    try:
+                        english = _translate_to_english(client, body.model, qtext, body.source_language)
+                        if not english:
+                            raise RuntimeError("empty translation")
+                    except Exception as e:
+                        grand["errors"] += 1
+                        yield _emit("translate_error", title=title, question_id=qid,
+                                    sequence_id=q["sequence_id"], question_text=qtext, error=str(e))
+                        continue
+
+                    has_blank_row = q["answer_id"] is not None
+                    action = "update_blank" if has_blank_row else "insert"
+                    yield _emit("fill", title=title, question_id=qid, sequence_id=q["sequence_id"],
+                                question_text=qtext, translation=english, action=action)
+
+                    if not body.dry_run:
+                        with conn.cursor() as cur:
+                            if has_blank_row:
+                                cur.execute("UPDATE Answer SET answer_text = %s, is_correct = 1 "
+                                            "WHERE answer_id = %s", (english, q["answer_id"]))
+                                l_upd += 1
+                            else:
+                                cur.execute("INSERT INTO Answer (lesson_id, question_id, answer_text, is_correct) "
+                                            "VALUES (%s, %s, %s, 1)", (lid, qid, english))
+                                l_ins += 1
+                            cur.execute("UPDATE Question SET has_answer = 1, answer_category = 'practice' "
+                                        "WHERE question_id = %s", (qid,))
+                    else:
+                        if has_blank_row: l_upd += 1
+                        else: l_ins += 1
+
+                    l_filled += 1
+
+                if body.dry_run:
+                    conn.rollback()
+                else:
+                    conn.commit()
+
+                grand["lessons"] += 1
+                grand["filled"] += l_filled
+                grand["inserted"] += l_ins
+                grand["updated"] += l_upd
+                grand["already_had_answer"] += l_had
+
+                yield _emit("lesson_done", title=title, lesson_id=lid,
+                            filled=l_filled, inserted=l_ins, updated=l_upd,
+                            already_had_answer=l_had, total=len(questions))
+
+            yield _emit("summary", dry_run=body.dry_run, totals=grand,
+                        note="filled answers are machine translations — review before relying on them")
+            logger.info("fill-vocab-answers | dry_run=%s %s", body.dry_run, grand)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("fill-vocab-answers failed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
 lambda_handler = Mangum(app)
