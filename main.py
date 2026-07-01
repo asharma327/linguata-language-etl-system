@@ -1575,7 +1575,7 @@ class GrammarScriptToAudio:
         prompt = f"""
             You are an expert language-learning instructor creating short grammar lesson audio for a premium language-learning application aimed at adult professionals.
 
-            Transform the grammar content below into a spoken lesson script.
+            Transform the grammar content below into a spoken lesson script that should be in english.
 
             Requirements:
 

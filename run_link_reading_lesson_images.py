@@ -6,17 +6,39 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"     # or your EB URL
-DATABASE = "german"
-DRY_RUN = False
+DATABASE = "spanish"
+DRY_RUN = False  # True = don't actually update the DB, just show what would happen
 
 # Each lesson: target by lesson_id OR title, plus its image_url.
 LESSONS = [
-    {"title": "unit5_conversation_practice1", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit5_pronunciation_conversation_language.png"},
-    {"title": "unit5_conversation_practice2", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit5_pronunciation_conversation_language.png"},
-    {"title": "unit5_conversation_practice3", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit5_pronunciation_conversation_language.png"},
-    {"title": "unit5_conversation_practice4", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit5_pronunciation_conversation_language.png"},
-    {"title": "unit4_situation_1", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit4_visa_travel_introduction.png"},
-    {"title": "unit4_situation_2", "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/german/unit_images/unit4_visa_travel_introduction.png"},
+    {
+        "title": "unit1_narratives",
+        "image_url": "https://content-media-generation.s3.amazonaws.com/spanish/images/3300_40069_unit1_basic_sentences.png",
+    },
+    {
+        "title": "unit2_narratives",
+        "image_url": "https://content-media-generation.s3.amazonaws.com/spanish/images/3348_40467_unit2_basic_sentences.png",
+    },
+    {
+        "title": "unit3_narratives",
+        "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/spanish/unit_images/unit3_travel_embassy_exchange.png",
+    },
+    {
+        "title": "unit4_narratives",
+        "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/spanish/unit_images/unit4_money_introductions_location.png",
+    },
+    {
+        "title": "unit5_narratives",
+        "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/spanish/unit_images/unit5_lunch_introductions_verbs.png",
+    },
+    {
+        "title": "unit6_narratives",
+        "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/spanish/unit_images/unit6_ordering_food_verbs.png",
+    },
+    {
+        "title": "unit7_narratives",
+        "image_url": "https://content-media-generation.s3.us-east-1.amazonaws.com/spanish/unit_images/unit7_apartments_renting_housing.png",
+    },
     # {"lesson_id": 4123, "image_url": "https://..."},
 ]
 

@@ -8,14 +8,20 @@ load_dotenv()
 BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"
 
 # --- choose ONE action ---
-ACTION = "delete-questions"          # "delete-questions" or "delete-lessons"
+ACTION = "delete-lessons"          # "delete-questions" or "delete-lessons"
 
-DATABASE = "extractiondb"
+DATABASE = "spanish"
 DRY_RUN = False                     # True = preview + rollback; False = actually delete
 KEEP_USER_HISTORY = False          # True = don't delete userResponses / user_attempts rows
 
 TITLES = [
-    
+    "unit1_narratives",
+    "unit2_narratives",
+    "unit3_narratives",
+    "unit4_narratives",
+    "unit5_narratives",
+    "unit6_narratives",
+    "unit7_narratives",
 ]
 LESSON_IDS = []          # used when ACTION == "delete-lessons"  
 

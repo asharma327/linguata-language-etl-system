@@ -17,7 +17,7 @@ if __name__ == "__main__":
 
     S3_PREFIX = "spanish/unit_images"  # S3 prefix where generated PNGs are written
 
-    UNITS         = None         # e.g. [1, 2, 3] to target specific units; None = auto-detect all
+    UNITS         = [1]         # e.g. [1, 2, 3] to target specific units; None = auto-detect all
     FORCE         = False        # re-generate even if an image already exists in S3
     IMAGE_MODEL   = "gpt-image-1"
     THEME_MODEL   = "gpt-4o-mini"

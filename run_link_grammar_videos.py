@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-language = "german"
+language = "italian"
 
 DB = {
     "host": os.environ.get("DB_HOST"),
@@ -17,8 +17,9 @@ DB = {
 # Restrict to specific grammar lessons (the ones whose video you regenerated).
 # Leave empty to process every .mp4 in the prefix.
 TITLES = [
-    # "unit10_grammar",
-    # "unit12_grammar",
+    "unit6_language_usage",
+    "unit13_language_usage",
+    "unit20_language_usage",
 ]
 
 # False = link only lessons with no video yet.
