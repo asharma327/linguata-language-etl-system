@@ -1362,7 +1362,7 @@ def get_grammar_tts_settings(database_name: str):
         "hindi": {
             "voice": "marin",
             "instructions": """
-                Speak as an experienced Hindi language instructor from India.
+                Speak as an experienced Hindi language instructor from India and speaking in English.
 
                 Use authentic Indian pronunciation, rhythm, and intonation.
 
@@ -1389,7 +1389,7 @@ def get_grammar_tts_settings(database_name: str):
                         "spanish": {
                             "voice": "marin",
                             "instructions": """
-                Speak as an experienced Spanish language instructor.
+                Speak as an experienced Spanish language instructor and speaking in English.
 
                 Use authentic Spanish pronunciation, rhythm, and intonation.
 
@@ -1416,7 +1416,7 @@ def get_grammar_tts_settings(database_name: str):
                         "japanese": {
                             "voice": "marin",
                             "instructions": """
-                Speak as an experienced Japanese language instructor from Japan.
+                Speak as an experienced Japanese language instructor from Japan and speaking in English.
 
                 Use authentic Japanese pronunciation, rhythm, pitch patterns, and intonation.
 
@@ -1443,7 +1443,7 @@ def get_grammar_tts_settings(database_name: str):
                         "german": {
                             "voice": "marin",
                             "instructions": """
-                Speak as an experienced German language instructor from Germany.
+                Speak as an experienced German language instructor from Germany and speaking in English.
 
                 Use authentic German pronunciation, rhythm, and intonation.
 
@@ -1467,10 +1467,10 @@ def get_grammar_tts_settings(database_name: str):
                 """
                         },
 
-                        "french": {
+                        "extractiondb": {
                             "voice": "marin",
                             "instructions": """
-                Speak as an experienced French language instructor from France.
+                Speak as an experienced French language instructor from France and speaking in English.
 
                 Use authentic French pronunciation, rhythm, and intonation.
 
@@ -1497,7 +1497,7 @@ def get_grammar_tts_settings(database_name: str):
                         "italian": {
                             "voice": "marin",
                             "instructions": """
-                Speak as an experienced Italian language instructor from Italy.
+                Speak as an experienced Italian language instructor from Italy and speaking in English.
 
                 Use authentic Italian pronunciation, rhythm, and intonation.
 
@@ -1524,7 +1524,7 @@ def get_grammar_tts_settings(database_name: str):
                         "chinese": {
                             "voice": "marin",
                             "instructions": """
-                Speak as an experienced Mandarin Chinese language instructor.
+                Speak as an experienced Mandarin Chinese language instructor and speaking in English.
 
                 Use authentic Mandarin pronunciation, tones, rhythm, and intonation.
 
