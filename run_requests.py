@@ -16,7 +16,7 @@ if __name__ == "__main__":
             "host": os.environ["DB_HOST"],
             "user": os.environ["DB_USER"],
             "password": os.environ["DB_PASSWORD"],
-            "database": "spanish",
+            "database": "japanese",
         },
 
         # "files": [
@@ -34,12 +34,12 @@ if __name__ == "__main__":
         "folder": BASE,
 
         "cefr_mapping": [
-            {"min": 1,  "max": 5,  "cefr_level": "A1"},
-            {"min": 6,  "max": 10, "cefr_level": "A2"},
-            # {"min": 11, "max": 15, "cefr_level": "B1"},
-            # {"min": 16, "max": 20, "cefr_level": "B2"},
-            # {"min": 21, "max": 25, "cefr_level": "C1"},
-            # {"min": 26, "max": 30, "cefr_level": "C2"},
+            {"min": 1,  "max": 7,  "cefr_level": "A1"},
+            {"min": 8,  "max": 15, "cefr_level": "A2"},
+            {"min": 16, "max": 23, "cefr_level": "B1"},
+            {"min": 24, "max": 30, "cefr_level": "B2"},
+            # {"min": 31, "max": 37, "cefr_level": "C1"},
+            # {"min": 38, "max": 44, "cefr_level": "C2"},
         ]
     })
 

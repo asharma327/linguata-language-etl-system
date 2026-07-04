@@ -17,8 +17,7 @@ DB = {
 # Restrict to specific grammar lessons (the ones whose video you regenerated).
 # Leave empty to process every .mp4 in the prefix.
 TITLES = [
-    "unit6_language_usage",
-    "unit13_language_usage",
+    "unit12_language_usage",
     "unit20_language_usage",
 ]
 
@@ -46,7 +45,7 @@ def run():
     if TITLES:
         payload["titles"] = TITLES
 
-    with requests.post("http://localhost:8010/link-grammar-videos",
+    with requests.post("http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com/link-grammar-videos",
                        json=payload, stream=True, timeout=3600) as resp:
         for raw in resp.iter_lines(decode_unicode=True):
             if not raw:
