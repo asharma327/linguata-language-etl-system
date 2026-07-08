@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-language = "italian"
+language = "japanese"
 
 DB = {
     "host": os.environ.get("DB_HOST"),
@@ -16,10 +16,7 @@ DB = {
 
 # Restrict to specific grammar lessons (the ones whose video you regenerated).
 # Leave empty to process every .mp4 in the prefix.
-TITLES = [
-    "unit12_language_usage",
-    "unit20_language_usage",
-]
+TITLES = [ "unit17_grammar_kono_sono_ano"]
 
 # False = link only lessons with no video yet.
 # True  = REPLACE existing video for the matched lessons (use after QA regenerate).

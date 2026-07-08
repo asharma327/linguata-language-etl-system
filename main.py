@@ -10,6 +10,7 @@ import base64
 import os
 import logging
 from pathlib import Path
+from google.genai import types
 from typing import Optional
 from mangum import Mangum
 from dotenv import load_dotenv
@@ -63,23 +64,6 @@ class LessonImageTarget(BaseModel):
     additional_prompt: str | None = None    # overrides global prompt for this lesson
 
 
-class GenerateImagesRequest(BaseModel):
-    db: DBConfig
-    units: list[int] | None = None                  # path 1: select vocab lessons by unit number
-    lessons: list[LessonImageTarget] | None = None  # path 2: explicit lesson/question targets
-    titles: list[str] | None = None
-    translate: bool = True
-    additional_prompt: str | None = None            # global; per-lesson value overrides this
-    limit_questions: int | None = None                     # max questions to process (units path)
-    translate: bool = False                         # True if question_text is NOT already in English
-    s3_bucket: str
-    s3_prefix: str = "spanish"
-    aws_region: str = "us-east-1"
-    openai_api_key: str | None = None               # falls back to OPENAI_API_KEY env var
-    aws_access_key_id: str | None = None            # falls back to AWS_ACCESS_KEY_ID env var
-    aws_secret_access_key: str | None = None        # falls back to AWS_SECRET_ACCESS_KEY env var
-
-
 class GrammarAudioTarget(BaseModel):
     lesson_id: int
     article_ids: list[int] | None = None  # if None → all articles for the lesson
@@ -105,26 +89,6 @@ class GenerateListeningQuestionsRequest(BaseModel):
     cefr_level: str = "A1"                           # fallback when no mapping matches
     cefr_mapping: list[CefrRange] | None = None      # unit-range → CEFR level (same as other routes)
 
-
-class GenerateVocabAudioRequest(BaseModel):
-    db: DBConfig
-    titles: list[str] | None = None 
-    s3_bucket: str
-    s3_prefix: str                                    # S3 prefix where MP3s are uploaded
-    aws_region: str = "us-east-1"
-    aws_access_key_id: str | None = None
-    aws_secret_access_key: str | None = None
-    openai_api_key: str | None = None
-    limit: int | None = None                          # cap number of questions to process
-    tts_model: str = "gpt-4o-mini-tts"
-    voice: str = "alloy"
-    tts_instructions: str | None = (
-        "Speak slowly and clearly with a warm, friendly, teacher-like tone. "
-        "When the text is English, use standard native English with no foreign accent "
-        "(clear, neutral pronunciation)."
-    )
-    source_language: str = "en"                       # AWS Translate source language code
-    target_language: str = "hi"                       # AWS Translate target language code (e.g. "hi", "es")
 
 
 class GenerateArticleQuestionsRequest(BaseModel):
@@ -963,14 +927,46 @@ def _insert_vocab_audio_row(conn, lesson_id: int, question_id: int,
         else:
             raise
 
+class GenerateImagesRequest(BaseModel):
+    db: DBConfig
+    units: list[int] | None = None                  # path 1: select vocab lessons by unit number
+    lessons: list[LessonImageTarget] | None = None  # path 2: explicit lesson/question targets
+    titles: list[str] | None = None
+    translate: bool = True
+    additional_prompt: str | None = None            # global; per-lesson value overrides this
+    limit_questions: int | None = None                     # max questions to process (units path)
+    translate: bool = False                         # True if question_text is NOT already in English
+    s3_bucket: str
+    s3_prefix: str = "spanish"
+    aws_region: str = "us-east-1"
+    gemini_api_key: str | None = None
+    openai_api_key: str | None = None               # falls back to OPENAI_API_KEY env var
+    aws_access_key_id: str | None = None            # falls back to AWS_ACCESS_KEY_ID env var
+    aws_secret_access_key: str | None = None        # falls back to AWS_SECRET_ACCESS_KEY env var
 
 # --- VocabToPictures class (unchanged) ---
+from openai import OpenAI
+from google import genai
 
 class VocabToPictures:
     """Generate images for vocabulary words using OpenAI, return bytes (no local save)."""
 
-    def __init__(self, api_key: str | None = None, model: str = "gpt-image-1", size: str = "1024x1024"):
-        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+    def __init__(
+        self,
+        openai_api_key: str | None = None,
+        gemini_api_key: str | None = None,
+        model: str = "models/gemini-3.1-flash-lite-image",
+        size: str = "1024x1024",
+    ):
+
+        self.openai = OpenAI(
+            api_key=openai_api_key or os.getenv("OPENAI_API_KEY")
+        )
+
+        self.gemini = genai.Client(
+            api_key=gemini_api_key or os.getenv("GEMINI_API_KEY")
+        )
+
         self.model = model
         self.size = size
 
@@ -978,7 +974,7 @@ class VocabToPictures:
                      additional_prompt: str | None = None) -> dict | None:
         try:
             if translate:
-                resp = self.client.chat.completions.create(
+                resp = self.openai.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[{"role": "user", "content": (
                         "Here is a word or phrase from a language learning textbook's vocabulary section. "
@@ -1058,19 +1054,59 @@ class VocabToPictures:
             if additional_prompt:
                 gen_prompt += f"\n\n{additional_prompt}"
 
-            result = self.client.images.generate(model=self.model, prompt=gen_prompt, size=self.size)
+            # result = self.client.images.generate(model=self.model, prompt=gen_prompt, size=self.size)
 
-            if result.data and hasattr(result.data[0], "b64_json") and result.data[0].b64_json:
-                return {
-                    "image_bytes": base64.b64decode(result.data[0].b64_json),
-                    "original_text": word,
-                    "translated_text": english,
-                    "model": self.model,
-                    "requested_size": self.size,
-                }
+            # if result.data and hasattr(result.data[0], "b64_json") and result.data[0].b64_json:
+            #     return {
+            #         "image_bytes": base64.b64decode(result.data[0].b64_json),
+            #         "original_text": word,
+            #         "translated_text": english,
+            #         "model": self.model,
+            #         "requested_size": self.size,
+            #     }
 
-        except openai.PermissionDeniedError:
-            print(f"OpenAI permission denied. Skipping: {word}")
+            from google.genai import types
+
+            response = self.gemini.models.generate_content(
+                model=self.model,
+                contents=gen_prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["TEXT", "IMAGE"],
+                    image_config=types.ImageConfig(
+                        aspect_ratio="1:1",
+                        # image_size="1K", 
+                    )
+                ),
+            )
+
+            image_bytes = None
+
+            # Gemini can return multiple parts (text, images, etc.)
+            # We look for the first part that contains image data.
+            if response.candidates and response.candidates[0].content:
+                for part in response.candidates[0].content.parts:
+                    inline = getattr(part, "inline_data", None)
+                    if inline and getattr(inline, "data", None):
+                        raw = inline.data # google-genai usually returns bytes; guard for base64-string SDK variants
+
+                        if isinstance(raw, str):
+                            raw = base64.b64decode(raw)
+                        image_bytes = raw
+                        break
+                
+            if image_bytes is None:
+                raise RuntimeError("Gemini returned no image.")
+
+            return {
+                "image_bytes": image_bytes,
+                "original_text": word,
+                "translated_text": english,
+                "model": self.model,
+                "requested_size": self.size,
+            }
+
+        # except openai.PermissionDeniedError:
+            # print(f"OpenAI permission denied. Skipping: {word}")
         except Exception as e:
             print(f"generate_one failed for '{word}': {e}")
 
@@ -1239,7 +1275,13 @@ def generate_lesson_images(body: GenerateImagesRequest):
             yield _emit("summary", total_items=0, succeeded=0, failed=0)
             return
 
-        generator = VocabToPictures(api_key=body.openai_api_key, model="gpt-image-1", size="1024x1024")
+        # generator = VocabToPictures(api_key=body.openai_api_key, model="gpt-image-1", size="1024x1024")
+        generator = VocabToPictures(
+            openai_api_key=body.openai_api_key,
+            gemini_api_key=body.gemini_api_key,
+            model="models/gemini-3.1-flash-lite-image",
+            size="1024x1024",
+        )
         succeeded = failed = 0
 
         try:
@@ -1920,6 +1962,27 @@ def generate_listening_questions(body: GenerateListeningQuestionsRequest):
     )
 
 
+class GenerateVocabAudioRequest(BaseModel):
+    db: DBConfig
+    titles: list[str] | None = None 
+    s3_bucket: str
+    s3_prefix: str                                    # S3 prefix where MP3s are uploaded
+    aws_region: str = "us-east-1"
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    openai_api_key: str | None = None
+    limit: int | None = None                          # cap number of questions to process
+    tts_model: str = "gpt-4o-mini-tts"
+    voice: str = "alloy"
+    tts_instructions: str | None = (
+        "Speak slowly and clearly with a warm, friendly, teacher-like tone. "
+        "When the text is English, use standard native English with no foreign accent "
+        "(clear, neutral pronunciation)."
+    )
+    source_language: str = "en"                       # AWS Translate source language code
+    target_language: str = "hi"                       # AWS Translate target language code (e.g. "hi", "es")
+
+
 def get_tts_settings(database_name: str):
     database_name = database_name.lower().strip()
 
@@ -2133,11 +2196,34 @@ def get_tts_settings(database_name: str):
 
     return settings[database_name]
 
-
 # NOTE: GenerateVocabAudioRequest needs:  title: str | None = None
 # (source_language / target_language / voice / tts_instructions are no longer
 #  used by this route — audio is spoken from question_text with per-language
 #  settings from get_tts_settings — but they can stay on the model harmlessly.)
+
+
+import re
+
+# --- Japanese-only text normalizer (strip romaji/English before TTS) -------------
+_JP_PATTERN = re.compile(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\u30FC。、「」・？！…]+')
+_JP_CHAR = re.compile(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
+
+
+def normalize_japanese_tts(text: str) -> str | None:
+    """
+    Return only the Japanese portion of `text` so TTS never reads romaji/English glosses.
+    Returns None if there's no Japanese to speak -> caller skips + reports (a missing file
+    is safer than one that reads romaji aloud).
+    """
+    if not text:
+        return None
+    matches = _JP_PATTERN.findall(text)
+    if not matches:
+        return None
+    joined = " ".join(m.strip() for m in matches if m.strip())
+    if not joined or not _JP_CHAR.search(joined):
+        return None
+    return joined
 
 
 @app.post("/generate-vocab-audio")
@@ -2145,21 +2231,21 @@ def generate_vocab_audio(body: GenerateVocabAudioRequest):
     """
     Streams NDJSON progress while generating audio for vocabulary questions whose audio
     is MISSING (no Audio row, or a row whose audio_url is NULL/blank).
- 
+
     Scope: body.titles (one or many lessons); omit titles to scan the whole DB.
-    Audio is spoken from the QUESTION TEXT, using per-language voice + instructions
-    from get_tts_settings. Each question is independent — one failure doesn't stop the rest.
-    For a question with a blank Audio row, the row is UPDATED in place; otherwise a row is INSERTed.
+    Audio is spoken from the QUESTION TEXT, using per-language voice + instructions.
+    For the Japanese DB, romaji/English is stripped so only Japanese is spoken; a
+    question with no Japanese content is skipped and reported (never read as romaji).
     """
- 
+
     def stream():
         effective_api_key = body.openai_api_key or os.getenv("OPENAI_API_KEY")
         if not effective_api_key:
             yield _emit("error", message="OpenAI API key is required."); return
- 
+
         openai_client = OpenAI(api_key=effective_api_key)
         s3 = _make_s3_client(body.aws_region, body.aws_access_key_id, body.aws_secret_access_key)
- 
+
         try:
             conn = connect_to_db(body.db)
         except Exception as e:
@@ -2167,6 +2253,7 @@ def generate_vocab_audio(body: GenerateVocabAudioRequest):
             return
 
         database_name = body.db.database
+        is_japanese = database_name.strip().lower() == "japanese"
         try:
             tts_settings = get_tts_settings(database_name)
         except ValueError as e:
@@ -2177,9 +2264,9 @@ def generate_vocab_audio(body: GenerateVocabAudioRequest):
         voice = tts_settings["voice"]
         tts_instructions = tts_settings["instructions"]
         yield _emit("start", action="generate-vocab-audio",
-                    database=database_name,
+                    database=database_name, japanese_normalization=is_japanese,
                     scope=(body.titles if body.titles else "whole_db"))
- 
+
         # Vocab questions whose audio is missing: no Audio row, OR a row with blank/NULL url.
         sql = """
             SELECT q.question_id, q.lesson_id, q.sequence_id, q.question_text,
@@ -2199,7 +2286,7 @@ def generate_vocab_audio(body: GenerateVocabAudioRequest):
         if body.limit is not None:
             sql += " LIMIT %s"
             params.append(int(body.limit))
- 
+
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
@@ -2207,16 +2294,16 @@ def generate_vocab_audio(body: GenerateVocabAudioRequest):
         except Exception as e:
             conn.close()
             yield _emit("error", message=f"Failed to query vocab questions: {e}"); return
- 
+
         yield _emit("found", total=len(rows))
         if not rows:
             conn.close()
-            yield _emit("summary", total_found=0, succeeded=0, failed=0)
+            yield _emit("summary", total_found=0, succeeded=0, failed=0, skipped=0)
             return
- 
+
         prefix = body.s3_prefix.rstrip("/")
-        succeeded = failed = 0
- 
+        succeeded = failed = skipped = 0
+
         try:
             for idx, row in enumerate(rows, start=1):
                 question_id   = row["question_id"]
@@ -2224,28 +2311,43 @@ def generate_vocab_audio(body: GenerateVocabAudioRequest):
                 sequence_id   = row["sequence_id"]
                 question_text = row["question_text"]
                 lesson_title  = row["lesson_title"]
- 
+
                 safe_title = _safe_slug(lesson_title)
                 s3_key    = f"{prefix}/{lesson_id}_{question_id}_{safe_title}.mp3"
                 audio_url = f"https://{body.s3_bucket}.s3.{body.aws_region}.amazonaws.com/{s3_key}"
- 
+
                 yield _emit("processing", n=idx, total=len(rows),
                             lesson_title=lesson_title, question_id=question_id,
                             sequence_id=sequence_id, question_text=question_text)
- 
+
                 try:
                     if not (question_text or "").strip():
                         raise ValueError("question_text is blank - nothing to speak")
- 
-                    # 1. TTS from the QUESTION text
+
+                    # Japanese: strip romaji/English so TTS speaks only the Japanese.
+                    text_to_speak = question_text
+                    if is_japanese:
+                        jp = normalize_japanese_tts(question_text)
+                        if jp is None:
+                            skipped += 1
+                            yield _emit("skipped", question_id=question_id, sequence_id=sequence_id,
+                                        lesson_title=lesson_title, question_text=question_text,
+                                        reason="no Japanese text to speak (would have read romaji)")
+                            continue
+                        text_to_speak = jp
+                        if jp != question_text:
+                            yield _emit("normalized", question_id=question_id,
+                                        original=question_text, spoken=jp)
+
+                    # 1. TTS from the (normalized) text
                     audio_bytes = _generate_tts_bytes(
-                        openai_client, question_text, body.tts_model, voice, tts_instructions,
+                        openai_client, text_to_speak, body.tts_model, voice, tts_instructions,
                     )
- 
+
                     # 2. Upload (deterministic key -> overwrites any stale file)
                     s3.put_object(Bucket=body.s3_bucket, Key=s3_key,
                                   Body=audio_bytes, ContentType="audio/mpeg")
- 
+
                     # 3. UPDATE blank row in place, or INSERT if none
                     with conn.cursor() as cur:
                         cur.execute(
@@ -2253,10 +2355,11 @@ def generate_vocab_audio(body: GenerateVocabAudioRequest):
                             (question_id,),
                         )
                         existing = cur.fetchone()
- 
+
                     action = "updated" if existing else "inserted"
                     if existing:
-                        metadata = json.dumps({"source": "tts", "tts_model": body.tts_model, "voice": voice})
+                        metadata = json.dumps({"source": "tts", "tts_model": body.tts_model,
+                                               "voice": voice, "spoken_text": text_to_speak})
                         with conn.cursor() as cur:
                             try:
                                 cur.execute(
@@ -2274,29 +2377,30 @@ def generate_vocab_audio(body: GenerateVocabAudioRequest):
                         _insert_vocab_audio_row(
                             conn, lesson_id, question_id, sequence_id, audio_url, body.tts_model, voice,
                         )
- 
+
                     conn.commit()
                     succeeded += 1
                     yield _emit("success", question_id=question_id, sequence_id=sequence_id,
                                 lesson_title=lesson_title, audio_url=audio_url, row=action)
- 
+
                 except Exception as e:
                     conn.rollback()
                     failed += 1
                     yield _emit("failed", question_id=question_id, sequence_id=sequence_id,
                                 lesson_title=lesson_title, error=str(e))
- 
-            yield _emit("summary", total_found=len(rows), succeeded=succeeded, failed=failed)
-            logger.info("generate-vocab-audio done | found=%d ok=%d fail=%d",
-                        len(rows), succeeded, failed)
- 
+
+            yield _emit("summary", total_found=len(rows),
+                        succeeded=succeeded, failed=failed, skipped=skipped)
+            logger.info("generate-vocab-audio done | found=%d ok=%d fail=%d skip=%d",
+                        len(rows), succeeded, failed, skipped)
+
         except Exception as e:
             conn.rollback()
             logger.error("generate-vocab-audio crashed: %s\n%s", e, traceback.format_exc())
             yield _emit("error", message=str(e))
         finally:
             conn.close()
- 
+
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 

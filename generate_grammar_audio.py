@@ -10,7 +10,7 @@ if __name__ == "__main__":
     # ==========================================================
     # CHANGE ONLY THIS WHEN SWITCHING LANGUAGES
     # ==========================================================
-    DATABASE_NAME = "italian"
+    DATABASE_NAME = "japanese"
     # ==========================================================
 
     DB = {
@@ -24,8 +24,7 @@ if __name__ == "__main__":
     # OPTION 1: exact lesson titles (one or many)
     # ----------------------------------------------------------
     TITLES = [
-        "unit12_language_usage",
-        "unit20_language_usage",
+        "unit17_grammar_kono_sono_ano",
     ]
 
     # ----------------------------------------------------------
