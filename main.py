@@ -2209,6 +2209,13 @@ _JP_PATTERN = re.compile(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\u30FC。、�
 _JP_CHAR = re.compile(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
 
 
+import re
+
+# --- Japanese-only text normalizer (strip romaji/English before TTS) -------------
+_JP_PATTERN = re.compile(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\u30FC。、「」・？！…]+')
+_JP_CHAR = re.compile(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
+
+
 def normalize_japanese_tts(text: str) -> str | None:
     """
     Return only the Japanese portion of `text` so TTS never reads romaji/English glosses.
@@ -2325,19 +2332,15 @@ def generate_vocab_audio(body: GenerateVocabAudioRequest):
                         raise ValueError("question_text is blank - nothing to speak")
 
                     # Japanese: strip romaji/English so TTS speaks only the Japanese.
+                    # If there's no Japanese content, fall back to the original text (generate normally).
                     text_to_speak = question_text
                     if is_japanese:
                         jp = normalize_japanese_tts(question_text)
-                        if jp is None:
-                            skipped += 1
-                            yield _emit("skipped", question_id=question_id, sequence_id=sequence_id,
-                                        lesson_title=lesson_title, question_text=question_text,
-                                        reason="no Japanese text to speak (would have read romaji)")
-                            continue
-                        text_to_speak = jp
-                        if jp != question_text:
-                            yield _emit("normalized", question_id=question_id,
-                                        original=question_text, spoken=jp)
+                        if jp is not None:
+                            text_to_speak = jp
+                            if jp != question_text:
+                                yield _emit("normalized", question_id=question_id,
+                                            original=question_text, spoken=jp)
 
                     # 1. TTS from the (normalized) text
                     audio_bytes = _generate_tts_bytes(

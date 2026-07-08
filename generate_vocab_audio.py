@@ -194,7 +194,7 @@ if __name__ == "__main__":
     if LIMIT:
         payload["limit"] = LIMIT
 
-    with requests.post("http://localhost:8000/generate-vocab-audio",
+    with requests.post("http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com/generate-vocab-audio",
                        json=payload, stream=True) as resp:
         for raw in resp.iter_lines(decode_unicode=True):
             if not raw:
