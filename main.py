@@ -6905,4 +6905,234 @@ def fill_vocab_answers(body: FillVocabAnswersRequest):
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
+# =============================================================================
+#  /regenerate-grammar-questions
+#
+#  Grammar MCQs were rebalanced into single-answer learning/practice questions, but
+#  their TEXT still reads as multiple-choice nonsense. This route rewrites the text
+#  IN PLACE from the lesson's article, keeping the same learning/practice split and
+#  the same question rows (so images/audio/user history stay attached).
+#
+#  Per grammar lesson (by title):
+#    1. read all Article text + classify questions: learning (no real answer) / practice (has answer)
+#    2. ONE OpenAI call: from the article, generate L learning questions + P practice Q&A pairs
+#    3. rewrite each learning row's text (stays answerless); rewrite each practice row's text
+#       and write the generated answer (is_correct=1, has_answer=1)
+#    4. re-run the grammar backfill so answer_category stays consistent
+#
+#  Streams NDJSON. dry_run=True (default): makes the LLM call so you can review the
+#  rewrites, writes nothing, rolls back. Commits per lesson on a live run.
+#
+#  Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse / OpenAI / os /
+#         _GRAMMAR_BACKFILL_SQL.
+# =============================================================================
+
+
+class RegenerateGrammarQuestionsRequest(BaseModel):
+    db: DBConfig
+    titles: list[str]
+    model: str = "gpt-4o-mini"
+    openai_api_key: str | None = None
+    dry_run: bool = True
+
+
+def _generate_grammar_question_set(client, model: str, article_text: str,
+                                   n_learning: int, n_practice: int) -> dict:
+    """
+    One call: from the article, produce n_learning learning questions (no answer needed)
+    and n_practice practice questions each with a correct answer. Returns:
+        {"learning": ["q", ...], "practice": [{"question": "...", "answer": "..."}, ...]}
+    """
+    system = (
+        "You write grammar exercises for a language-learning app, based ONLY on the provided "
+        "grammar lesson article. Produce two kinds of questions:\n"
+        "- LEARNING questions: standalone prompts that help a learner think about / recall the "
+        "grammar concept. They do NOT need a checkable answer.\n"
+        "- PRACTICE questions: each has ONE clear correct answer derivable from the article.\n"
+        "Every question must make sense on its own (no 'which of the following', no multiple-choice "
+        "phrasing, no references to options). Return ONLY JSON, no prose, no code fences."
+    )
+    user = (
+        f"ARTICLE:\n{article_text}\n\n"
+        f"Generate exactly {n_learning} LEARNING questions and {n_practice} PRACTICE questions.\n"
+        "Return JSON of this exact shape:\n"
+        '{"learning": ["question", ...], '
+        '"practice": [{"question": "question", "answer": "the correct answer"}, ...]}'
+    )
+    resp = client.chat.completions.create(
+        model=model, temperature=0.2,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+    )
+    content = (resp.choices[0].message.content or "").strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*", "", content)
+        content = re.sub(r"\s*```$", "", content)
+    data = json.loads(content)
+    learning = [str(q).strip() for q in data.get("learning", []) if str(q).strip()]
+    practice = []
+    for item in data.get("practice", []):
+        q = str(item.get("question", "")).strip()
+        a = str(item.get("answer", "")).strip()
+        if q and a:
+            practice.append({"question": q, "answer": a})
+    return {"learning": learning, "practice": practice}
+
+
+@app.post("/regenerate-grammar-questions")
+def regenerate_grammar_questions(body: RegenerateGrammarQuestionsRequest):
+
+    def stream():
+        if not body.titles:
+            yield _emit("error", message="Provide at least one title in 'titles'")
+            return
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"DB connection failed: {e}")
+            return
+
+        client = OpenAI(api_key=body.openai_api_key or os.getenv("OPENAI_API_KEY"))
+
+        yield _emit("start", action="regenerate-grammar-questions",
+                    titles=body.titles, model=body.model, dry_run=body.dry_run)
+
+        grand = {"lessons": 0, "learning_rewritten": 0, "practice_rewritten": 0,
+                 "shortfalls": 0, "skipped_lessons": 0, "errors": 0}
+        touched_lesson_ids: list = []
+
+        try:
+            for title in body.titles:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT lesson_id, type FROM Lesson WHERE title = %s", (title,))
+                    lrow = cur.fetchone()
+                if not lrow:
+                    grand["skipped_lessons"] += 1
+                    yield _emit("lesson_skipped", title=title, reason="lesson not found"); continue
+                if lrow["type"] != "grammar":
+                    grand["skipped_lessons"] += 1
+                    yield _emit("lesson_skipped", title=title,
+                                reason=f"lesson type is '{lrow['type']}', expected grammar"); continue
+                lid = lrow["lesson_id"]
+
+                # article text (all articles for the lesson, in order)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT content FROM Article WHERE lesson_id = %s ORDER BY sequence_id, article_id",
+                        (lid,),
+                    )
+                    article_text = "\n\n".join((r["content"] or "").strip() for r in cur.fetchall() if r["content"])
+
+                if not article_text.strip():
+                    grand["skipped_lessons"] += 1
+                    yield _emit("lesson_skipped", title=title, reason="lesson has no article text"); continue
+
+                # classify questions by structure: learning (no real answer) / practice (has answer)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT q.question_id, q.sequence_id,
+                                  (SELECT a.answer_id FROM Answer a WHERE a.question_id=q.question_id
+                                   ORDER BY a.answer_id ASC LIMIT 1) AS answer_id,
+                                  (SELECT COUNT(*) FROM Answer a
+                                   WHERE a.question_id=q.question_id AND TRIM(a.answer_text) <> '') AS real_answers
+                           FROM Question q WHERE q.lesson_id = %s
+                           ORDER BY q.sequence_id, q.question_id""",
+                        (lid,),
+                    )
+                    qs = cur.fetchall()
+
+                learning_rows = [q for q in qs if q["real_answers"] == 0]
+                practice_rows = [q for q in qs if q["real_answers"] >= 1]
+                n_learning, n_practice = len(learning_rows), len(practice_rows)
+
+                yield _emit("lesson_start", title=title, lesson_id=lid,
+                            learning=n_learning, practice=n_practice)
+
+                if n_learning == 0 and n_practice == 0:
+                    yield _emit("lesson_done", title=title, lesson_id=lid,
+                                learning_rewritten=0, practice_rewritten=0, note="no questions")
+                    continue
+
+                # one LLM call for the whole lesson
+                try:
+                    gen = _generate_grammar_question_set(client, body.model, article_text,
+                                                         n_learning, n_practice)
+                except Exception as e:
+                    grand["errors"] += 1
+                    yield _emit("lesson_error", title=title, error=f"LLM generation failed: {e}")
+                    continue
+
+                gen_learning = gen["learning"]
+                gen_practice = gen["practice"]
+
+                # map by count (report any shortfall rather than mismatching)
+                l_pairs = list(zip(learning_rows, gen_learning))
+                p_pairs = list(zip(practice_rows, gen_practice))
+                if len(gen_learning) < n_learning or len(gen_practice) < n_practice:
+                    grand["shortfalls"] += 1
+                    yield _emit("shortfall", title=title,
+                                wanted_learning=n_learning, got_learning=len(gen_learning),
+                                wanted_practice=n_practice, got_practice=len(gen_practice))
+
+                l_done = p_done = 0
+                cur = conn.cursor()
+
+                # learning: rewrite text only, stays answerless
+                for row, new_q in l_pairs:
+                    yield _emit("learning_rewrite", title=title, question_id=row["question_id"],
+                                new_question=new_q)
+                    if not body.dry_run:
+                        cur.execute("UPDATE Question SET question_text=%s, has_answer=0 WHERE question_id=%s",
+                                    (new_q, row["question_id"]))
+                    l_done += 1
+
+                # practice: rewrite text + write the answer
+                for row, item in p_pairs:
+                    yield _emit("practice_rewrite", title=title, question_id=row["question_id"],
+                                new_question=item["question"], new_answer=item["answer"])
+                    if not body.dry_run:
+                        cur.execute("UPDATE Question SET question_text=%s, has_answer=1 WHERE question_id=%s",
+                                    (item["question"], row["question_id"]))
+                        if row["answer_id"]:
+                            cur.execute("UPDATE Answer SET answer_text=%s, is_correct=1 WHERE answer_id=%s",
+                                        (item["answer"], row["answer_id"]))
+                        else:
+                            cur.execute("INSERT INTO Answer (lesson_id, question_id, answer_text, is_correct) "
+                                        "VALUES (%s,%s,%s,1)", (lid, row["question_id"], item["answer"]))
+                    p_done += 1
+
+                cur.close()
+
+                if body.dry_run:
+                    conn.rollback()
+                else:
+                    conn.commit()
+                    touched_lesson_ids.append(lid)
+
+                grand["lessons"] += 1
+                grand["learning_rewritten"] += l_done
+                grand["practice_rewritten"] += p_done
+                yield _emit("lesson_done", title=title, lesson_id=lid,
+                            learning_rewritten=l_done, practice_rewritten=p_done)
+
+            # re-run grammar backfill on the lessons we changed
+            if not body.dry_run and touched_lesson_ids:
+                fmt = ",".join(["%s"] * len(touched_lesson_ids))
+                with conn.cursor() as cur:
+                    cur.execute(_GRAMMAR_BACKFILL_SQL.format(ids=fmt),
+                                tuple(touched_lesson_ids) + tuple(touched_lesson_ids))
+                conn.commit()
+                yield _emit("backfill", lessons=len(touched_lesson_ids))
+
+            yield _emit("summary", dry_run=body.dry_run, totals=grand)
+            logger.info("regenerate-grammar-questions | dry_run=%s %s", body.dry_run, grand)
+
+        except Exception as e:
+            conn.rollback()
+            logger.error("regenerate-grammar-questions failed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e), rolled_back=True)
+        finally:
+            conn.close()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
 lambda_handler = Mangum(app)
