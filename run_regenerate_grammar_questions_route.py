@@ -5,8 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"
-DATABASE = "hindi"
+BASE = "http://localhost:8000"      # or your EB URL
+DATABASE = "japanese"
 DRY_RUN = True
 MODEL = "gpt-4o-mini"
 
@@ -64,6 +64,8 @@ TITLES = [
     # "unit35_numbers_time_grammar"
 ]
 
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
 
 def run():
     payload = {
@@ -75,6 +77,7 @@ def run():
         },
         "titles": TITLES,
         "model": MODEL,
+        "openai_api_key": OPENAI_API_KEY,     # sent in the request body, like the other routes
         "dry_run": DRY_RUN,
     }
 

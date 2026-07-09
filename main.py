@@ -6991,7 +6991,12 @@ def regenerate_grammar_questions(body: RegenerateGrammarQuestionsRequest):
             yield _emit("error", message=f"DB connection failed: {e}")
             return
 
-        client = OpenAI(api_key=body.openai_api_key or os.getenv("OPENAI_API_KEY"))
+        effective_api_key = body.openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not effective_api_key:
+            conn.close()
+            yield _emit("error", message="OpenAI API key is required (send openai_api_key in the request).")
+            return
+        client = OpenAI(api_key=effective_api_key)
 
         yield _emit("start", action="regenerate-grammar-questions",
                     titles=body.titles, model=body.model, dry_run=body.dry_run)
