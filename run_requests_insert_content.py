@@ -6,20 +6,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.com"
-DATABASE = "german"
+DATABASE = "italian"
 DRY_RUN = False    # True = preview + rollback; False = actually insert
 
 # Target the lesson by title (preferred) or lesson_id.
-TITLE = "unit2_variation_drill"
+TITLE = "unit23_model7"
 LESSON_ID = None
 
 # Put ONLY the new items here — not the whole lesson.
 # Vocabulary / writing / grammar question = single answer:
 QUESTIONS_AND_ANSWERS = [
-    # {
-    #     "question_text": "Vide",
-    #     "answers": [{"answer_text": "La valise vide est à moi", "is_correct": True}],
-    # },
+    {
+        "question_text": "Chi ci sarà al party di Laura?",
+        "answers": [{"answer_text": "Ci saranno Franca, Claudia e Mara.", "is_correct": True}],
+    }
     # {
     #     "question_text": "Il ne reste que onze jours de vacances.",
     #     "answers": [{"answer_text": "There are only eleven days of vacation left.", "is_correct": True}],

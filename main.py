@@ -70,27 +70,6 @@ class GrammarAudioTarget(BaseModel):
 
 
 
-class GenerateListeningQuestionsRequest(BaseModel):
-    db: DBConfig
-    s3_bucket: str
-    s3_audio_prefix: str                              # S3 prefix where MP3 files live
-    s3_output_prefix: str                             # S3 prefix where question JSONs are written
-    aws_region: str = "us-east-1"
-    aws_access_key_id: str | None = None
-    aws_secret_access_key: str | None = None
-    openai_api_key: str | None = None
-    num_questions: int = 10
-    model: str = "gpt-4o-mini"
-    transcription_model: str = "whisper-1"
-    temperature: float = 0.4
-    force: bool = False                               # re-process even if output JSON already in S3
-    limit: int | None = None                          # max number of audio files to process
-    lesson_type: str = "listening"                    # Lesson.type value for inserted lessons
-    cefr_level: str = "A1"                           # fallback when no mapping matches
-    cefr_mapping: list[CefrRange] | None = None      # unit-range → CEFR level (same as other routes)
-
-
-
 class GenerateArticleQuestionsRequest(BaseModel):
     db: DBConfig
     s3_bucket: str
@@ -1830,136 +1809,182 @@ def generate_grammar_audio(body: GenerateGrammarAudioRequest):
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
+class GenerateListeningQuestionsRequest(BaseModel):
+    db: DBConfig
+    s3_bucket: str
+    s3_audio_prefix: str                              # S3 prefix where MP3 files live
+    s3_output_prefix: str                             # S3 prefix where question JSONs are written
+    aws_region: str = "us-east-1"
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    openai_api_key: str | None = None
+    num_questions: int = 10
+    model: str = "gpt-4o-mini"
+    transcription_model: str = "whisper-1"
+    temperature: float = 0.4
+    force: bool = False                               # re-process even if output JSON already in S3
+    limit: int | None = None                          # max number of audio files to process
+    lesson_type: str = "listening"                    # Lesson.type value for inserted lessons
+    cefr_level: str = "A1"                           # fallback when no mapping matches
+    cefr_mapping: list[CefrRange] | None = None      # unit-range → CEFR level (same as other routes)
+
+
+# =============================================================================
+#  /generate-listening-questions  (streaming)
+#
+#  For each MP3 under s3_bucket/s3_audio_prefix/:
+#    1. transcribe (Whisper)
+#    2. generate MCQs (GPT)
+#    3. upload the question JSON to s3_output_prefix/<stem>.json
+#    4. insert Lesson + Audio + Questions + Answers
+#
+#  Skips a file if its output JSON already exists in S3 (unless force=True) AND
+#  now also skips if a lesson with that title already exists in the DB (prevents
+#  duplicate lessons when S3 and DB drift) — unless force=True.
+#
+#  Streams NDJSON so a long run (many Whisper calls) doesn't sit silent and get
+#  cut by the proxy/ALB, and so you can watch progress.
+#
+#  Reuses connect_to_db / DBConfig / logger / _emit / StreamingResponse / OpenAI /
+#         _make_s3_client / _list_s3_mp3_keys / _s3_key_exists / _transcribe_from_s3 /
+#         _build_listening_lesson_title / _extract_unit_number_from_filename /
+#         _build_listening_mcq_messages / _parse_mcq_json_response / _validate_mcq_list /
+#         _insert_listening_lesson / resolve_cefr / Path / json / os.
+# =============================================================================
+
+
 @app.post("/generate-listening-questions")
 def generate_listening_questions(body: GenerateListeningQuestionsRequest):
-    """
-    For each MP3 in s3_bucket/s3_audio_prefix/:
-      1. Transcribes the audio via OpenAI Whisper.
-      2. Generates MCQ questions from the transcript via GPT.
-      3. Uploads the question JSON to s3_bucket/s3_output_prefix/<stem>.json.
-      4. Inserts Lesson + Questions + Answers into the database.
 
-    Files whose output JSON already exists in S3 are skipped unless force=True.
-    Use limit to cap how many new files are processed in a single call.
-    """
-    effective_api_key = body.openai_api_key or os.getenv("OPENAI_API_KEY")
-    if not effective_api_key:
-        raise HTTPException(status_code=400, detail="OpenAI API key is required.")
+    def stream():
+        effective_api_key = body.openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not effective_api_key:
+            yield _emit("error", message="OpenAI API key is required (send openai_api_key in the request).")
+            return
 
-    openai_client = OpenAI(api_key=effective_api_key)
-    s3 = _make_s3_client(body.aws_region, body.aws_access_key_id, body.aws_secret_access_key)
-
-    try:
-        audio_keys = _list_s3_mp3_keys(s3, body.s3_bucket, body.s3_audio_prefix)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list S3 objects: {e}")
-
-    if not audio_keys:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No .mp3 files found under s3://{body.s3_bucket}/{body.s3_audio_prefix}",
-        )
-
-    try:
-        conn = connect_to_db(body.db)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not connect to database: {e}")
-
-    output_prefix = body.s3_output_prefix.rstrip("/")
-    results = []
-    succeeded = failed = skipped = 0
-
-    for audio_key in audio_keys:
-        if body.limit is not None and (succeeded + failed) >= body.limit:
-            break
-
-        stem = Path(audio_key).stem
-        out_key = f"{output_prefix}/{stem}.json"
-        title = _build_listening_lesson_title(Path(audio_key).name)
-
-        log: dict = {
-            "audio_key": audio_key,
-            "output_key": out_key,
-            "lesson_title": title,
-            "status": None,
-            "lesson_id": None,
-            "error": None,
-        }
-
-        # Skip if output already exists and force=False
-        if not body.force and _s3_key_exists(s3, body.s3_bucket, out_key):
-            log["status"] = "skipped"
-            skipped += 1
-            results.append(log)
-            continue
+        openai_client = OpenAI(api_key=effective_api_key)
+        s3 = _make_s3_client(body.aws_region, body.aws_access_key_id, body.aws_secret_access_key)
 
         try:
-            # 1. Transcribe audio from S3
-            transcript = _transcribe_from_s3(
-                s3, body.s3_bucket, audio_key, openai_client, body.transcription_model
-            )
+            audio_keys = _list_s3_mp3_keys(s3, body.s3_bucket, body.s3_audio_prefix)
+        except Exception as e:
+            yield _emit("error", message=f"Failed to list S3 objects: {e}")
+            return
 
-            # 2. Generate MCQ questions
-            unit_number = _extract_unit_number_from_filename(Path(audio_key).name)
-            messages = _build_listening_mcq_messages(transcript, unit_number, body.num_questions)
-            resp = openai_client.chat.completions.create(
-                model=body.model,
-                messages=messages,
-                temperature=body.temperature,
-            )
-            raw_content = resp.choices[0].message.content.strip()
+        if not audio_keys:
+            yield _emit("error",
+                        message=f"No .mp3 files found under s3://{body.s3_bucket}/{body.s3_audio_prefix}")
+            return
 
-            # 3. Parse and validate
-            mcq_items = _parse_mcq_json_response(raw_content)
-            _validate_mcq_list(mcq_items, body.num_questions)
+        try:
+            conn = connect_to_db(body.db)
+        except Exception as e:
+            yield _emit("error", message=f"Could not connect to database: {e}")
+            return
 
-            # 4. Upload JSON to S3
-            s3.put_object(
-                Bucket=body.s3_bucket,
-                Key=out_key,
-                Body=json.dumps(mcq_items, ensure_ascii=False, indent=2).encode("utf-8"),
-                ContentType="application/json",
-            )
+        yield _emit("start", action="generate-listening-questions",
+                    database=body.db.database, audio_files=len(audio_keys),
+                    force=body.force, limit=body.limit)
 
-            # 5. Insert Lesson + Audio + Questions + Answers into DB
-            audio_url = (
-                f"https://{body.s3_bucket}.s3.{body.aws_region}.amazonaws.com/{audio_key}"
-            )
-            cefr = resolve_cefr(Path(audio_key).name, body.cefr_mapping, body.cefr_level)
-            lesson_id = _insert_listening_lesson(
-                conn, title, body.lesson_type, cefr, mcq_items, audio_url
-            )
-            conn.commit()
+        output_prefix = body.s3_output_prefix.rstrip("/")
+        succeeded = failed = skipped = 0
+        processed = 0
 
-            log["status"] = "success"
-            log["lesson_id"] = lesson_id
-            succeeded += 1
+        try:
+            for idx, audio_key in enumerate(audio_keys, start=1):
+                # limit caps files actually PROCESSED (skips don't count) — stop once reached
+                if body.limit is not None and processed >= int(body.limit):
+                    yield _emit("limit_reached", limit=int(body.limit))
+                    break
+
+                stem = Path(audio_key).stem
+                out_key = f"{output_prefix}/{stem}.json"
+                title = _build_listening_lesson_title(Path(audio_key).name)
+
+                # skip: output JSON already in S3
+                if not body.force and _s3_key_exists(s3, body.s3_bucket, out_key):
+                    skipped += 1
+                    yield _emit("skipped", n=idx, total=len(audio_keys), audio_key=audio_key,
+                                lesson_title=title, reason="output JSON already exists in S3")
+                    continue
+
+                # skip: lesson with this title already in the DB (prevents duplicate lessons)
+                if not body.force:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT lesson_id FROM Lesson WHERE title = %s", (title,))
+                        existing = cur.fetchone()
+                    if existing:
+                        skipped += 1
+                        yield _emit("skipped", n=idx, total=len(audio_keys), audio_key=audio_key,
+                                    lesson_title=title, lesson_id=existing["lesson_id"],
+                                    reason="lesson already exists in DB")
+                        continue
+
+                processed += 1
+                yield _emit("processing", n=idx, total=len(audio_keys),
+                            audio_key=audio_key, lesson_title=title)
+
+                try:
+                    # 1. transcribe
+                    transcript = _transcribe_from_s3(
+                        s3, body.s3_bucket, audio_key, openai_client, body.transcription_model
+                    )
+                    yield _emit("transcribed", lesson_title=title, chars=len(transcript or ""))
+
+                    # 2. generate MCQs
+                    unit_number = _extract_unit_number_from_filename(Path(audio_key).name)
+                    messages = _build_listening_mcq_messages(transcript, unit_number, body.num_questions)
+                    resp = openai_client.chat.completions.create(
+                        model=body.model, messages=messages, temperature=body.temperature,
+                    )
+                    raw_content = resp.choices[0].message.content.strip()
+
+                    # 3. parse + validate
+                    mcq_items = _parse_mcq_json_response(raw_content)
+                    _validate_mcq_list(mcq_items, body.num_questions)
+                    yield _emit("questions_generated", lesson_title=title, questions=len(mcq_items))
+
+                    # 4. upload JSON to S3
+                    s3.put_object(
+                        Bucket=body.s3_bucket,
+                        Key=out_key,
+                        Body=json.dumps(mcq_items, ensure_ascii=False, indent=2).encode("utf-8"),
+                        ContentType="application/json",
+                    )
+
+                    # 5. insert Lesson + Audio + Questions + Answers
+                    audio_url = (f"https://{body.s3_bucket}.s3.{body.aws_region}.amazonaws.com/{audio_key}")
+                    cefr = resolve_cefr(Path(audio_key).name, body.cefr_mapping, body.cefr_level)
+                    lesson_id = _insert_listening_lesson(
+                        conn, title, body.lesson_type, cefr, mcq_items, audio_url
+                    )
+                    conn.commit()
+
+                    succeeded += 1
+                    yield _emit("success", n=idx, total=len(audio_keys), lesson_title=title,
+                                lesson_id=lesson_id, questions=len(mcq_items),
+                                cefr_level=cefr, audio_url=audio_url, output_key=out_key)
+
+                except Exception as e:
+                    conn.rollback()
+                    failed += 1
+                    yield _emit("failed", n=idx, total=len(audio_keys), audio_key=audio_key,
+                                lesson_title=title, error=str(e))
+
+            yield _emit("summary", total_audio_files=len(audio_keys),
+                        processed=succeeded + failed, succeeded=succeeded,
+                        failed=failed, skipped=skipped)
+            logger.info("generate-listening-questions done | files=%d ok=%d fail=%d skip=%d",
+                        len(audio_keys), succeeded, failed, skipped)
 
         except Exception as e:
             conn.rollback()
-            log["status"] = "failed"
-            log["error"] = str(e)
-            failed += 1
+            logger.error("generate-listening-questions crashed: %s\n%s", e, traceback.format_exc())
+            yield _emit("error", message=str(e))
+        finally:
+            conn.close()
 
-        results.append(log)
-
-    conn.close()
-
-    all_ok = failed == 0
-    return JSONResponse(
-        content={
-            "status": "ok" if all_ok else "partial",
-            "summary": {
-                "total_audio_files": len(audio_keys),
-                "processed": succeeded + failed,
-                "succeeded": succeeded,
-                "failed": failed,
-                "skipped": skipped,
-            },
-            "results": results,
-        },
-        status_code=200 if all_ok else 207,
-    )
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 class GenerateVocabAudioRequest(BaseModel):

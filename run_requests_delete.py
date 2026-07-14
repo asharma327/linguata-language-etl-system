@@ -10,14 +10,12 @@ BASE = "http://language-media-gen-env.eba-jqm7dpsh.us-east-1.elasticbeanstalk.co
 # --- choose ONE action ---
 ACTION = "delete-lessons"          # "delete-questions" or "delete-lessons"
 
-DATABASE = "japanese"
-DRY_RUN = False                     # True = preview + rollback; False = actually delete
+DATABASE = "spanish"
+DRY_RUN = True                     # True = preview + rollback; False = actually delete
 KEEP_USER_HISTORY = False          # True = don't delete userResponses / user_attempts rows
 
-TITLES = [
-    "unit2_production_aural_comprehension",
-]
-LESSON_IDS = []          # used when ACTION == "delete-lessons"  
+TITLES = []
+LESSON_IDS = []         # used when ACTION == "delete-lessons"  
 
 QUESTION_IDS = []        # used when ACTION == "delete-questions"
 
