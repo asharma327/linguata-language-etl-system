@@ -5,10 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# url = "http://localhost:8000/clone-schema"
-
 # BASE = "/Users/adhaar/desktop/client_documents/learnx/extracted-json/japanese"     #Fow Mac
-BASE = r"D:\DATA\tmp\try"                                                           # For Windows
+BASE = r"D:\DATA\tmp\try"                                                            #For Windows
 
 if __name__ == "__main__":
     response = requests.post("http://127.0.0.1:8000/insert-lessons", json={
@@ -16,7 +14,7 @@ if __name__ == "__main__":
             "host": os.environ["DB_HOST"],
             "user": os.environ["DB_USER"],
             "password": os.environ["DB_PASSWORD"],
-            "database": "spanish",
+            "database": "chinese",
         },
 
         # "files": [
@@ -34,12 +32,12 @@ if __name__ == "__main__":
         "folder": BASE,
 
         "cefr_mapping": [
-            {"min": 1,  "max": 5,  "cefr_level": "A1"},
-            {"min": 6,  "max": 10, "cefr_level": "A2"},
-            {"min": 11, "max": 15, "cefr_level": "B1"},
-            {"min": 16, "max": 20, "cefr_level": "B2"},
-            {"min": 21, "max": 25, "cefr_level": "C1"},
-            {"min": 26, "max": 30, "cefr_level": "C2"},
+            {"min": 1,  "max": 9,  "cefr_level": "A1"},
+            {"min": 10,  "max": 18, "cefr_level": "A2"},
+            {"min": 19, "max": 27, "cefr_level": "B1"},
+            {"min": 28, "max": 36, "cefr_level": "B2"},
+            {"min": 37, "max": 45, "cefr_level": "C1"},
+            {"min": 46, "max": 55, "cefr_level": "C2"},
         ]
     })
 

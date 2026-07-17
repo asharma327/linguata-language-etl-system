@@ -1999,11 +1999,7 @@ class GenerateVocabAudioRequest(BaseModel):
     limit: int | None = None                          # cap number of questions to process
     tts_model: str = "gpt-4o-mini-tts"
     voice: str = "alloy"
-    tts_instructions: str | None = (
-        "Speak slowly and clearly with a warm, friendly, teacher-like tone. "
-        "When the text is English, use standard native English with no foreign accent "
-        "(clear, neutral pronunciation)."
-    )
+    tts_instructions: str 
     source_language: str = "en"                       # AWS Translate source language code
     target_language: str = "hi"                       # AWS Translate target language code (e.g. "hi", "es")
 
@@ -2189,29 +2185,36 @@ def get_tts_settings(database_name: str):
         "chinese": {
             "voice": "nova",
             "instructions": """
-                Speak as a native Chinese speaker from China.
+                Speak as a native Mandarin Chinese speaker from Mainland China.
 
-                This audio is for a language-learning application.
+                This recording is for beginners learning Mandarin Chinese.
 
-                Use authentic Chinese pronunciation, pitch patterns, rhythm, and intonation.
+                Use Standard Mandarin (Putonghua).
 
-                Do not use an American or foreign accent.
+                Pronounce every Chinese character with its correct lexical tone.
 
-                Speak clearly, calmly, patiently, like a teacher.
+                Preserve all Mandarin tones accurately:
+                • First tone (high level)
+                • Second tone (rising)
+                • Third tone (falling-rising when spoken in isolation, natural contextual realization in connected speech)
+                • Fourth tone (falling)
+                • Neutral tone where appropriate
 
-                Use a slightly slower pace than everyday conversation so learners can clearly hear each word.
+                Apply natural Mandarin tone sandhi, including third-tone sandhi and "一" (yī) and "不" (bù) tone changes, exactly as a native speaker would.
 
-                Pause naturally between words and phrases.
+                Maintain natural native pronunciation while ensuring every syllable remains clear.
 
-                Maintain natural pronunciation and rhythm.
+                Speak slowly enough that learners can distinguish each syllable and tone, but do not sound robotic.
 
-                Do not sound rushed.
+                Use natural pauses, rhythm, and sentence intonation.
 
-                Speak slowly
+                Do not add emphasis that changes meaning.
 
-                Do not translate, explain, or add words.
+                Do not skip, merge, or shorten syllables.
 
-                Only speak the provided text.
+                Do not translate, explain, or add any words.
+
+                Only speak the provided Chinese text exactly as written.
                 """
         }
     }
