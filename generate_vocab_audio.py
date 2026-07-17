@@ -19,6 +19,7 @@ if __name__ == "__main__":
     # Lessons to process. One or many — for a single lesson use a one-item list.
     # Set TITLES = None to scan the whole database.
     TITLES = [
+        "unit1_vocab_1"
     ]
     LIMIT = None  # limit number of questions to process (for testing); set to None for no limit
 
